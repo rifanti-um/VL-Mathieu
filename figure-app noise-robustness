@@ -1,0 +1,1114 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+Noise-robustness experiment for the velocity-variation functional V_L
+=====================================================================
+
+Mathieu equation
+    x'' + (a - 2 q cos(2t)) x = 0,
+
+with
+    V_L(tau)      = |v(tau) - v(0)| / tau,
+    mu_VL(tau)   = log(V_L(tau)) / tau.
+
+Observational-noise model
+-------------------------
+Only the measured endpoint velocities are perturbed:
+
+    v_tilde(0)   = v(0)   + eta_0,
+    v_tilde(tau) = v(tau) + eta_tau,
+
+where eta_0, eta_tau ~ N(0, sigma^2) independently.
+
+The reported noise level alpha (%) is defined by
+
+    sigma = (alpha / 100) * v_ref,
+
+with the fixed nondimensional reference velocity v_ref = 1 over the entire
+parameter space. Thus 1%, 5%, and 10% correspond to sigma = 0.01, 0.05,
+and 0.10, respectively.
+
+Therefore
+    delta_eta = eta_tau - eta_0 ~ N(0, 2 sigma^2),
+
+and
+    V_L_tilde = | delta_v + delta_eta | / tau.
+
+The deterministic trajectory itself is NOT perturbed.
+
+Outputs
+-------
+1. Figure_A3_noise_representative_points.pdf/.png
+   - stable, near-boundary (unstable side), unstable representative points
+   - clean mu_VL
+   - Monte-Carlo median
+   - 5th--95th percentile interval
+   - true Floquet growth rate
+
+2. Figure_A4_noise_parameter_space.pdf/.png
+   (a) clean mu_VL
+   (b) median mu_VL with 1% Gaussian observational noise
+   (c) median mu_VL with 5% Gaussian observational noise
+   (d) |median(mu_VL noisy) - mu_VL clean|
+
+3. Table_A2_noise_sensitivity.csv
+   - Agreement / P_conv, FPR, FNR
+   - P_flip: classification change relative to clean V_L
+   - MAE in mu_VL
+   - Q95(|Delta mu|): 95th percentile of absolute noise perturbation
+4. Table_A2_noise_sensitivity.tex
+5. representative_noise_statistics.csv
+6. noise_experiment_metadata.txt
+7. clean_map_cache_*.npz
+
+Important design choice
+-----------------------
+The classification rule is fixed for EVERY noise level:
+
+    predicted unstable  <=>  mu_VL > MU_CLASS_THRESHOLD
+
+The default is MU_CLASS_THRESHOLD = 0.0, which follows the asymptotic
+bounded-vs-exponential dichotomy used in the manuscript. If Table A1
+(horizon sensitivity) uses a different fixed threshold, change ONLY
+MU_CLASS_THRESHOLD below and keep it unchanged for all noise levels.
+
+Efficiency
+----------
+The Mathieu coefficients have period T = pi. Instead of integrating each
+trajectory directly to tau = 120, this script computes the one-period
+monodromy matrix M = Phi(pi), then uses
+
+    Phi(tau) = Phi(r) M^n,     tau = n*pi + r.
+
+This gives both the Floquet reference and the clean endpoint velocity
+without a long integration for every parameter-grid point.
+"""
+
+from __future__ import annotations
+
+import csv
+import math
+import os
+from pathlib import Path
+from concurrent.futures import ProcessPoolExecutor
+
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.integrate import solve_ivp
+
+
+# ============================================================
+# 1. USER CONFIGURATION
+# ============================================================
+
+OUTDIR = Path("noise_robustness_outputs")
+OUTDIR.mkdir(parents=True, exist_ok=True)
+
+# Mathieu parameter-space map: same domain/grid as the manuscript
+A_MIN, A_MAX, N_A = 0.0, 12.0, 200
+Q_MIN, Q_MAX, N_Q = 0.0, 12.0, 200
+
+# Initial condition and observation horizon
+X0 = 1.0
+V0 = 0.0
+TAU = 120.0
+
+# Representative points used for Figure A3.
+#
+# IMPORTANT:
+# "Near boundary" is a geometric/Floquet-location label only.  The script does
+# NOT assume or state that this point must be the most noise-sensitive case.
+# Noise sensitivity is determined by the finite-time endpoint signal-to-noise
+# ratio |v(tau)-v(0)| / (sqrt(2)*sigma), not solely by distance to a stability
+# boundary.
+REPRESENTATIVE_POINTS = {
+    "Stable": (0.6, 0.2),
+    "Near boundary (unstable side)": (0.5, 0.4738),
+    "Unstable": (10.5, 8.0),
+}
+
+# Gaussian observational-noise levels for Figure A3 and Table A2.
+# Interpreted as sigma / V_NOISE_REF.
+NOISE_LEVELS_PERCENT = np.array([0.0, 0.5, 1.0, 2.0, 5.0, 10.0])
+
+# Panels requested for Figure A4
+A4_NOISE_LEVELS_PERCENT = (1.0, 5.0)
+
+# ------------------------------------------------------------
+# EXPLICIT DEFINITION OF "x% GAUSSIAN OBSERVATIONAL NOISE"
+# ------------------------------------------------------------
+# Let alpha denote the reported noise level in percent.  The standard
+# deviation of EACH independent endpoint-velocity measurement error is
+#
+#       sigma = (alpha / 100) * v_ref,
+#
+# with one fixed nondimensional reference velocity
+#
+#       v_ref = V_NOISE_REF = 1.
+#
+# Therefore:
+#       alpha =  1%  -> sigma = 0.01
+#       alpha =  5%  -> sigma = 0.05
+#       alpha = 10%  -> sigma = 0.10
+#
+# Since eta_0 and eta_tau are independent N(0,sigma^2), their difference has
+# standard deviation sqrt(2)*sigma.
+#
+# IMPORTANT: v_ref is fixed over the ENTIRE parameter space.  It is NOT
+# rescaled using the endpoint velocity or trajectory amplitude at each point.
+V_NOISE_REF = 1.0
+
+# Monte-Carlo sample counts.
+# Representative-point percentiles are inexpensive, so use more samples.
+N_MC_REP = 5000
+# Parameter-space medians only require moderate N because noise is applied
+# analytically to the two endpoint measurements, not by re-integrating ODEs.
+N_MC_MAP = 500
+
+# Reproducibility
+RANDOM_SEED = 20260816
+
+# ODE solver settings: match the manuscript
+METHOD = "DOP853"
+RTOL = 1e-9
+ATOL = 1e-9
+
+# True Floquet classification:
+# tiny numerical roundoff around zero is treated as stable.
+FLOQUET_ZERO_TOL = 1e-8
+
+# *** ONE FIXED CLASSIFICATION RULE FOR ALL NOISE LEVELS ***
+MU_CLASS_THRESHOLD = 0.0
+
+# Numerical floor only for taking logarithms; NOT a classification threshold.
+FLOAT_TINY = np.finfo(float).tiny
+VL_LOG_FLOOR = 1e-12
+
+# Parallel computation of the clean parameter-space map.
+# Set N_JOBS = 1 if multiprocessing is inconvenient in your environment.
+N_JOBS = max(1, (os.cpu_count() or 2) - 1)
+
+# Map Monte-Carlo batching avoids storing N_MC_MAP x 40,000 arrays at once.
+MAP_BATCH_SIZE = 2000
+
+# Plot settings
+DPI = 300
+CMAP_RATE = "turbo"       # blue -> green -> yellow -> red
+CMAP_DIFF = "magma"
+
+# Floquet stability boundary overlay in Figure A4(d).
+# The contour is extracted from the binary ground-truth map
+#     mu_F > FLOQUET_ZERO_TOL.
+# For the journal figure, the contour is intentionally left unlabeled inside
+# the panel; explain in the caption that the white contour denotes the Floquet
+# stability boundary. The Gaussian-noise convention is likewise documented in
+# the manuscript/caption rather than printed above the figure.
+SHOW_FLOQUET_BOUNDARY = True
+BOUNDARY_LINEWIDTH = 1.1
+
+plt.rcParams.update({
+    "font.size": 11,
+    "axes.labelsize": 11,
+    "axes.titlesize": 11,
+    "xtick.labelsize": 10,
+    "ytick.labelsize": 10,
+    "legend.fontsize": 9,
+})
+
+
+# ============================================================
+# 2. MATHIEU / FLOQUET UTILITIES
+# ============================================================
+
+PERIOD = math.pi
+
+
+def fundamental_rhs(t: float, y: np.ndarray, a: float, q: float):
+    """
+    Integrate two fundamental solutions simultaneously.
+
+    State ordering:
+        y = [phi11, phi21, phi12, phi22]
+
+    so that
+        Phi = [[phi11, phi12],
+               [phi21, phi22]]
+    """
+    phi11, phi21, phi12, phi22 = y
+    k = a - 2.0 * q * math.cos(2.0 * t)
+
+    return np.array([
+        phi21,
+        -k * phi11,
+        phi22,
+        -k * phi12,
+    ])
+
+
+def fundamental_matrix(a: float, q: float, t_end: float) -> np.ndarray:
+    """Return Phi(t_end) with Phi(0)=I."""
+    if abs(t_end) < 1e-15:
+        return np.eye(2)
+
+    sol = solve_ivp(
+        fun=lambda t, y: fundamental_rhs(t, y, a, q),
+        t_span=(0.0, float(t_end)),
+        y0=np.array([1.0, 0.0, 0.0, 1.0]),
+        method=METHOD,
+        rtol=RTOL,
+        atol=ATOL,
+    )
+
+    if not sol.success:
+        raise RuntimeError(
+            f"Fundamental-matrix integration failed at (a,q)=({a},{q}): "
+            f"{sol.message}"
+        )
+
+    p11, p21, p12, p22 = sol.y[:, -1]
+    return np.array([[p11, p12], [p21, p22]], dtype=float)
+
+
+def clean_point_quantities(a: float, q: float):
+    """
+    Compute:
+      delta_v_clean = v(tau) - v(0)
+      V_L_clean
+      mu_VL_clean
+      mu_F           = maximal Floquet growth rate
+
+    Uses periodic propagation Phi(tau)=Phi(r) M^n.
+    """
+    M = fundamental_matrix(a, q, PERIOD)
+
+    multipliers = np.linalg.eigvals(M)
+    rho = float(np.max(np.abs(multipliers)))
+    mu_F_raw = math.log(max(rho, FLOAT_TINY)) / PERIOD
+
+    # For a Hamiltonian Mathieu system stable Floquet multipliers lie on
+    # the unit circle; tiny +/- values are numerical roundoff.
+    mu_F = 0.0 if abs(mu_F_raw) <= FLOQUET_ZERO_TOL else max(0.0, mu_F_raw)
+
+    n_periods = int(math.floor(TAU / PERIOD))
+    remainder = TAU - n_periods * PERIOD
+
+    R = fundamental_matrix(a, q, remainder)
+    M_n = np.linalg.matrix_power(M, n_periods)
+
+    z0 = np.array([X0, V0], dtype=float)
+    z_tau = R @ M_n @ z0
+
+    v_tau = float(z_tau[1])
+    delta_v = v_tau - V0
+
+    V_L = abs(delta_v) / TAU
+    mu_VL = math.log(max(V_L, VL_LOG_FLOOR)) / TAU
+
+    return delta_v, V_L, mu_VL, mu_F
+
+
+def _grid_worker(args):
+    """Top-level worker for Windows-compatible multiprocessing."""
+    i_q, i_a, a, q = args
+    delta_v, V_L, mu_VL, mu_F = clean_point_quantities(a, q)
+    return i_q, i_a, delta_v, V_L, mu_VL, mu_F
+
+
+# ============================================================
+# 3. CLEAN PARAMETER-SPACE MAP + CACHE
+# ============================================================
+
+def compute_clean_maps(a_values: np.ndarray, q_values: np.ndarray):
+    """
+    Compute deterministic endpoint and Floquet maps.
+
+    Array convention:
+        rows    -> q
+        columns -> a
+    """
+    shape = (len(q_values), len(a_values))
+
+    delta_v_map = np.empty(shape, dtype=float)
+    VL_map = np.empty(shape, dtype=float)
+    muVL_map = np.empty(shape, dtype=float)
+    muF_map = np.empty(shape, dtype=float)
+
+    tasks = [
+        (iq, ia, float(a), float(q))
+        for iq, q in enumerate(q_values)
+        for ia, a in enumerate(a_values)
+    ]
+
+    print(f"Computing clean maps on {shape[1]} x {shape[0]} grid ...")
+    print(f"Parallel workers: {N_JOBS}")
+
+    if N_JOBS == 1:
+        iterator = map(_grid_worker, tasks)
+        for k, result in enumerate(iterator, start=1):
+            iq, ia, delta_v, VL, muVL, muF = result
+            delta_v_map[iq, ia] = delta_v
+            VL_map[iq, ia] = VL
+            muVL_map[iq, ia] = muVL
+            muF_map[iq, ia] = muF
+            if k % 1000 == 0 or k == len(tasks):
+                print(f"  completed {k}/{len(tasks)}")
+    else:
+        with ProcessPoolExecutor(max_workers=N_JOBS) as ex:
+            iterator = ex.map(_grid_worker, tasks, chunksize=20)
+            for k, result in enumerate(iterator, start=1):
+                iq, ia, delta_v, VL, muVL, muF = result
+                delta_v_map[iq, ia] = delta_v
+                VL_map[iq, ia] = VL
+                muVL_map[iq, ia] = muVL
+                muF_map[iq, ia] = muF
+                if k % 1000 == 0 or k == len(tasks):
+                    print(f"  completed {k}/{len(tasks)}")
+
+    return delta_v_map, VL_map, muVL_map, muF_map
+
+
+def cache_filename():
+    tau_tag = str(TAU).replace(".", "p")
+    return OUTDIR / f"clean_map_cache_na{N_A}_nq{N_Q}_tau{tau_tag}.npz"
+
+
+def load_or_compute_clean_maps(a_values, q_values):
+    cache = cache_filename()
+
+    if cache.exists():
+        data = np.load(cache)
+
+        same_config = (
+            np.array_equal(data["a_values"], a_values)
+            and np.array_equal(data["q_values"], q_values)
+            and float(data["tau"]) == TAU
+            and float(data["x0"]) == X0
+            and float(data["v0"]) == V0
+        )
+
+        if same_config:
+            print(f"Loading cached clean maps: {cache}")
+            return (
+                data["delta_v_map"],
+                data["VL_map"],
+                data["muVL_map"],
+                data["muF_map"],
+            )
+
+        print("Cache exists but configuration changed; recomputing.")
+
+    maps = compute_clean_maps(a_values, q_values)
+    delta_v_map, VL_map, muVL_map, muF_map = maps
+
+    np.savez_compressed(
+        cache,
+        a_values=a_values,
+        q_values=q_values,
+        tau=TAU,
+        x0=X0,
+        v0=V0,
+        delta_v_map=delta_v_map,
+        VL_map=VL_map,
+        muVL_map=muVL_map,
+        muF_map=muF_map,
+    )
+    print(f"Saved clean-map cache: {cache}")
+
+    return maps
+
+
+# ============================================================
+# 4. OBSERVATIONAL NOISE
+# ============================================================
+
+def sigma_from_percent(noise_percent: float) -> float:
+    return (noise_percent / 100.0) * V_NOISE_REF
+
+
+def noisy_mu_samples(delta_v: float, noise_percent: float, n_mc: int, rng):
+    """
+    Generate Monte-Carlo mu_VL samples.
+
+    Explicit measurement model:
+        eta0   ~ N(0,sigma^2)
+        etaTau ~ N(0,sigma^2)
+    independently.
+    """
+    if noise_percent == 0.0:
+        VL = abs(delta_v) / TAU
+        mu = math.log(max(VL, VL_LOG_FLOOR)) / TAU
+        return np.full(n_mc, mu, dtype=float)
+
+    sigma = sigma_from_percent(noise_percent)
+
+    eta0 = rng.normal(loc=0.0, scale=sigma, size=n_mc)
+    etaTau = rng.normal(loc=0.0, scale=sigma, size=n_mc)
+
+    noisy_delta_v = delta_v + (etaTau - eta0)
+    noisy_VL = np.abs(noisy_delta_v) / TAU
+    noisy_mu = np.log(np.maximum(noisy_VL, VL_LOG_FLOOR)) / TAU
+
+    return noisy_mu
+
+
+def median_noisy_mu_map(
+    delta_v_map: np.ndarray,
+    noise_percent: float,
+    n_mc: int,
+    seed: int,
+):
+    """
+    Return pixelwise Monte-Carlo median of mu_VL over the parameter grid.
+
+    For efficiency:
+        etaTau - eta0 ~ N(0, 2 sigma^2)
+    is sampled directly. This is exactly equivalent to sampling the two
+    endpoint errors independently and subtracting them.
+    """
+    if noise_percent == 0.0:
+        VL = np.abs(delta_v_map) / TAU
+        return np.log(np.maximum(VL, VL_LOG_FLOOR)) / TAU
+
+    sigma = sigma_from_percent(noise_percent)
+    rng = np.random.default_rng(seed)
+
+    flat = delta_v_map.ravel()
+    median_flat = np.empty_like(flat)
+
+    for start in range(0, len(flat), MAP_BATCH_SIZE):
+        stop = min(start + MAP_BATCH_SIZE, len(flat))
+        d = flat[start:stop]
+
+        # Common-random-number design within a noise level.
+        # Shape = (Monte Carlo realization, parameter point in batch)
+        z = rng.standard_normal(size=(n_mc, stop - start))
+        delta_eta = math.sqrt(2.0) * sigma * z
+
+        noisy_delta = d[None, :] + delta_eta
+        noisy_VL = np.abs(noisy_delta) / TAU
+        noisy_mu = np.log(np.maximum(noisy_VL, VL_LOG_FLOOR)) / TAU
+
+        median_flat[start:stop] = np.median(noisy_mu, axis=0)
+
+    return median_flat.reshape(delta_v_map.shape)
+
+
+# ============================================================
+# 5. FIGURE A3 — REPRESENTATIVE-POINT ROBUSTNESS
+# ============================================================
+
+def make_figure_A3():
+    rng = np.random.default_rng(RANDOM_SEED)
+
+    noise_levels = NOISE_LEVELS_PERCENT.astype(float)
+    n_panels = len(REPRESENTATIVE_POINTS)
+
+    fig, axes = plt.subplots(
+        1, n_panels,
+        figsize=(5.0 * n_panels, 4.2),
+        constrained_layout=True,
+    )
+    if n_panels == 1:
+        axes = [axes]
+
+    rep_rows = []
+
+    for ax, (label, (a, q)) in zip(axes, REPRESENTATIVE_POINTS.items()):
+        delta_v, VL_clean, mu_clean, mu_F = clean_point_quantities(a, q)
+
+        medians = []
+        p05 = []
+        p95 = []
+
+        for noise in noise_levels:
+            samples = noisy_mu_samples(
+                delta_v=delta_v,
+                noise_percent=float(noise),
+                n_mc=N_MC_REP,
+                rng=rng,
+            )
+
+            med = float(np.median(samples))
+            lo = float(np.percentile(samples, 5.0))
+            hi = float(np.percentile(samples, 95.0))
+
+            medians.append(med)
+            p05.append(lo)
+            p95.append(hi)
+
+            rep_rows.append({
+                "regime": label,
+                "a": a,
+                "q": q,
+                "noise_percent": noise,
+                "sigma": sigma_from_percent(float(noise)),
+                "mu_VL_clean": mu_clean,
+                "mu_VL_median": med,
+                "mu_VL_p05": lo,
+                "mu_VL_p95": hi,
+                "mu_F": mu_F,
+            })
+
+        medians = np.asarray(medians)
+        p05 = np.asarray(p05)
+        p95 = np.asarray(p95)
+
+        # Monte-Carlo interval and median
+        ax.fill_between(
+            noise_levels, p05, p95,
+            alpha=0.22,
+            label="5–95% Monte Carlo interval",
+        )
+        ax.plot(
+            noise_levels, medians,
+            marker="o",
+            linewidth=1.8,
+            label="Median noisy $\\mu_{V_L}$",
+        )
+
+        # Clean finite-time mu_VL as a horizontal reference
+        ax.axhline(
+            mu_clean,
+            linestyle="--",
+            linewidth=1.5,
+            label="Clean $\\mu_{V_L}$",
+        )
+
+        # True Floquet growth rate
+        ax.axhline(
+            mu_F,
+            linestyle=":",
+            linewidth=1.8,
+            label="Floquet $\\mu_F$",
+        )
+
+        ax.set_title(
+            f"{label}\n$(a,q)=({a:g},{q:g})$"
+        )
+        ax.set_xlabel(r"Gaussian noise level $\alpha$ (%)")
+        ax.set_ylabel(r"$\mu_{V_L}(\tau)$")
+        ax.grid(alpha=0.25)
+
+        # Keep zero visible whenever it is reasonably close to the data.
+        ymin = min(np.min(p05), mu_clean, mu_F)
+        ymax = max(np.max(p95), mu_clean, mu_F)
+        span = max(ymax - ymin, 1e-4)
+        if ymin > 0 and ymin < 0.25 * span:
+            ymin = 0.0
+        ax.set_ylim(ymin - 0.10 * span, ymax + 0.10 * span)
+
+        ax.legend(loc="best")
+
+        print(
+            f"{label:14s} (a,q)=({a:g},{q:g}) | "
+            f"mu_clean={mu_clean:.6e}, mu_F={mu_F:.6e}, "
+            f"|delta_v|={abs(delta_v):.6e}"
+        )
+
+    fig.savefig(OUTDIR / "Figure_A3_noise_representative_points.pdf",
+                bbox_inches="tight")
+    fig.savefig(OUTDIR / "Figure_A3_noise_representative_points.png",
+                dpi=DPI, bbox_inches="tight")
+    plt.close(fig)
+
+    # Export underlying representative-point statistics
+    csv_path = OUTDIR / "representative_noise_statistics.csv"
+    fieldnames = [
+        "regime", "a", "q", "noise_percent", "sigma",
+        "mu_VL_clean", "mu_VL_median",
+        "mu_VL_p05", "mu_VL_p95", "mu_F",
+    ]
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rep_rows)
+
+    print("Saved Figure A3 and representative-point CSV.")
+
+
+# ============================================================
+# 6. CLASSIFICATION METRICS FOR TABLE A2
+# ============================================================
+
+def safe_rate(num: int, den: int) -> float:
+    return float(num / den) if den > 0 else float("nan")
+
+
+def classification_metrics(mu_est: np.ndarray, muF_map: np.ndarray):
+    """
+    Ground truth:
+        unstable if mu_F > FLOQUET_ZERO_TOL
+
+    V_L prediction:
+        unstable if mu_est > MU_CLASS_THRESHOLD
+
+    MU_CLASS_THRESHOLD is NEVER changed with noise level.
+    """
+    true_unstable = muF_map > FLOQUET_ZERO_TOL
+    pred_unstable = mu_est > MU_CLASS_THRESHOLD
+
+    TP = int(np.sum(pred_unstable & true_unstable))
+    TN = int(np.sum(~pred_unstable & ~true_unstable))
+    FP = int(np.sum(pred_unstable & ~true_unstable))
+    FN = int(np.sum(~pred_unstable & true_unstable))
+
+    N = TP + TN + FP + FN
+
+    agreement = safe_rate(TP + TN, N)
+    fpr = safe_rate(FP, FP + TN)
+    fnr = safe_rate(FN, FN + TP)
+
+    return {
+        "TP": TP,
+        "TN": TN,
+        "FP": FP,
+        "FN": FN,
+        "Agreement": agreement,
+        # Alias retained in case Appendix A uses P_conv notation.
+        "P_conv": agreement,
+        "FPR": fpr,
+        "FNR": fnr,
+    }
+
+
+# ============================================================
+# 7. FIGURE A4 + TABLE A2
+# ============================================================
+
+def make_figure_A4_and_table_A2(
+    a_values,
+    q_values,
+    delta_v_map,
+    muVL_clean_map,
+    muF_map,
+):
+    # Compute all noisy median maps required for Table A2 only once.
+    noisy_maps = {0.0: muVL_clean_map.copy()}
+
+    for j, noise in enumerate(NOISE_LEVELS_PERCENT):
+        noise = float(noise)
+        if noise == 0.0:
+            continue
+
+        print(f"Monte-Carlo median map: noise={noise:g}%")
+        noisy_maps[noise] = median_noisy_mu_map(
+            delta_v_map=delta_v_map,
+            noise_percent=noise,
+            n_mc=N_MC_MAP,
+            seed=RANDOM_SEED + 1000 + j,
+        )
+
+    # --------------------------------------------------------
+    # Figure A4
+    # --------------------------------------------------------
+    mu_1 = noisy_maps[float(A4_NOISE_LEVELS_PERCENT[0])]
+    mu_5 = noisy_maps[float(A4_NOISE_LEVELS_PERCENT[1])]
+
+    # Requested absolute difference map:
+    delta_mu = np.abs(mu_5 - muVL_clean_map)
+
+    # Shared scale for panels (a)-(c) is essential for visual comparison.
+    rate_stack = np.concatenate([
+        muVL_clean_map.ravel(),
+        mu_1.ravel(),
+        mu_5.ravel(),
+    ])
+
+    finite_rate = rate_stack[np.isfinite(rate_stack)]
+    # Robust display limits avoid a few extreme logarithmic cancellations
+    # dominating the color scale.
+    vmin = float(np.percentile(finite_rate, 1.0))
+    vmax = float(np.percentile(finite_rate, 99.0))
+
+    extent = [
+        float(a_values[0]), float(a_values[-1]),
+        float(q_values[0]), float(q_values[-1]),
+    ]
+
+    # --------------------------------------------------------
+    # Publication-safe layout:
+    #   columns 1-2 : data panels
+    #   column 3    : dedicated colorbar axes
+    #
+    # The top-right colorbar serves panels (a)-(c), while the bottom-right
+    # colorbar serves panel (d).  This prevents the two colorbars from
+    # overlapping.
+    # --------------------------------------------------------
+    fig = plt.figure(
+        figsize=(12.2, 9.0),
+        constrained_layout=True,
+    )
+    gs = fig.add_gridspec(
+        nrows=2,
+        ncols=3,
+        width_ratios=[1.0, 1.0, 0.055],
+        height_ratios=[1.0, 1.0],
+    )
+
+    ax_a = fig.add_subplot(gs[0, 0])
+    ax_b = fig.add_subplot(gs[0, 1])
+    ax_c = fig.add_subplot(gs[1, 0])
+    ax_d = fig.add_subplot(gs[1, 1])
+    cax_rate = fig.add_subplot(gs[0, 2])
+    cax_diff = fig.add_subplot(gs[1, 2])
+
+    panel_data = [
+        ("(a) Clean", muVL_clean_map),
+        (
+            f"(b) {A4_NOISE_LEVELS_PERCENT[0]:g}% Gaussian noise",
+            mu_1,
+        ),
+        (
+            f"(c) {A4_NOISE_LEVELS_PERCENT[1]:g}% Gaussian noise",
+            mu_5,
+        ),
+    ]
+
+    image_handles = []
+
+    for ax, (title, data) in zip(
+        [ax_a, ax_b, ax_c],
+        panel_data,
+    ):
+        im = ax.imshow(
+            data,
+            origin="lower",
+            extent=extent,
+            aspect="auto",
+            cmap=CMAP_RATE,
+            vmin=vmin,
+            vmax=vmax,
+            interpolation="nearest",
+        )
+        image_handles.append(im)
+        ax.set_title(title)
+        ax.set_xlabel("$a$")
+        ax.set_ylabel("$q$")
+
+    # One shared colorbar for panels (a)-(c), in its own dedicated axis.
+    cbar_rate = fig.colorbar(
+        image_handles[0],
+        cax=cax_rate,
+    )
+    cbar_rate.set_label(r"$\mu_{V_L}(\tau)$")
+    cax_rate.set_title("(a)-(c)", fontsize=9, pad=7)
+
+    # Panel (d): absolute difference at the larger displayed noise level.
+    im_diff = ax_d.imshow(
+        delta_mu,
+        origin="lower",
+        extent=extent,
+        aspect="auto",
+        cmap=CMAP_DIFF,
+        interpolation="nearest",
+        vmin=0.0,
+    )
+    ax_d.set_title(
+        f"(d) $|\\mathrm{{median}}(\\widetilde{{\\mu}}_{{V_L}})"
+        f"-\\mu_{{V_L}}^{{\\rm clean}}|$ at "
+        f"{A4_NOISE_LEVELS_PERCENT[1]:g}%"
+    )
+    ax_d.set_xlabel("$a$")
+    ax_d.set_ylabel("$q$")
+
+    # Overlay the Floquet stability boundary on the difference map.
+    # We contour the binary stable/unstable ground-truth field at 0.5.
+    if SHOW_FLOQUET_BOUNDARY:
+        floquet_binary = (muF_map > FLOQUET_ZERO_TOL).astype(float)
+        boundary = ax_d.contour(
+            a_values,
+            q_values,
+            floquet_binary,
+            levels=[0.5],
+            colors="white",
+            linewidths=BOUNDARY_LINEWIDTH,
+        )
+
+    # Dedicated colorbar for panel (d), so it cannot overlap the rate bar.
+    cbar_diff = fig.colorbar(
+        im_diff,
+        cax=cax_diff,
+    )
+    cbar_diff.set_label(r"$\Delta\mu_{\rm noise}$")
+    cax_diff.set_title("(d)", fontsize=9, pad=7)
+
+    fig.savefig(
+        OUTDIR / "Figure_A4_noise_parameter_space.pdf",
+        bbox_inches="tight",
+    )
+    fig.savefig(
+        OUTDIR / "Figure_A4_noise_parameter_space.png",
+        dpi=DPI,
+        bbox_inches="tight",
+    )
+    plt.close(fig)
+
+    print("Saved Figure A4.")
+
+    # --------------------------------------------------------
+    # Table A2
+    # --------------------------------------------------------
+    rows = []
+
+    for noise in NOISE_LEVELS_PERCENT:
+        noise = float(noise)
+        mu_est = noisy_maps[noise]
+
+        metrics = classification_metrics(mu_est, muF_map)
+
+        # Noise sensitivity of finite-time V_L estimate:
+        # compare the median noisy field against the deterministic clean field.
+        abs_delta_mu = np.abs(mu_est - muVL_clean_map)
+        mae = float(np.mean(abs_delta_mu))
+        q95_abs_delta_mu = float(np.percentile(abs_delta_mu, 95.0))
+
+        # P_flip: fraction of parameter-grid points whose CLASSIFICATION
+        # changes relative to the clean finite-time V_L classification.
+        # The same fixed threshold is used for both clean and noisy fields.
+        clean_pred = muVL_clean_map > MU_CLASS_THRESHOLD
+        noisy_pred = mu_est > MU_CLASS_THRESHOLD
+        p_flip = float(np.mean(noisy_pred != clean_pred))
+
+        row = {
+            "Noise (%)": noise,
+            "Agreement": metrics["Agreement"],
+            "P_conv": metrics["P_conv"],
+            "FPR": metrics["FPR"],
+            "FNR": metrics["FNR"],
+            "P_flip": p_flip,
+            "MAE_muVL": mae,
+            "Q95_abs_delta_mu": q95_abs_delta_mu,
+            "TP": metrics["TP"],
+            "TN": metrics["TN"],
+            "FP": metrics["FP"],
+            "FN": metrics["FN"],
+        }
+        rows.append(row)
+
+    # CSV contains Agreement and P_conv alias, plus confusion counts.
+    csv_path = OUTDIR / "Table_A2_noise_sensitivity.csv"
+    fieldnames = [
+        "Noise (%)", "Agreement", "P_conv", "FPR", "FNR",
+        "P_flip", "MAE_muVL", "Q95_abs_delta_mu",
+        "TP", "TN", "FP", "FN",
+    ]
+
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+    # LaTeX version uses exactly the compact columns requested.
+    tex_path = OUTDIR / "Table_A2_noise_sensitivity.tex"
+    with open(tex_path, "w", encoding="utf-8") as f:
+        f.write(
+r"""\begin{table}[t]
+\centering
+\caption{Sensitivity of the finite-time velocity--variation growth-rate estimate to additive Gaussian observational noise. A noise level $\alpha$ means $\sigma=(\alpha/100)v_{\rm ref}$ with the fixed reference velocity $v_{\rm ref}=1$ over the full parameter space. The same classification threshold is used at every noise level. Here, $P_{\rm flip}$ is the fraction of grid points whose noisy median classification differs from the clean $V_L$ classification, and $Q_{95}$ is the 95th percentile of $|\Delta\mu|$.}
+\label{tab:noise_sensitivity}
+\begin{tabular}{ccccccc}
+\hline
+Noise & Agreement & FPR & FNR & $P_{\rm flip}$ & MAE & $Q_{95}(|\Delta\mu|)$ \\
+\hline
+"""
+        )
+
+        for row in rows:
+            f.write(
+                f"{row['Noise (%)']:g}\\% & "
+                f"{row['Agreement']:.4f} & "
+                f"{row['FPR']:.4f} & "
+                f"{row['FNR']:.4f} & "
+                f"{row['P_flip']:.4f} & "
+                f"{row['MAE_muVL']:.4e} & "
+                f"{row['Q95_abs_delta_mu']:.4e} "
+                + r"\\"
+                + "\n"
+            )
+
+        f.write(
+r"""\hline
+\end{tabular}
+\end{table}
+"""
+        )
+
+    print("\nTable A2")
+    print("-" * 112)
+    print(
+        f"{'Noise':>8s} {'Agreement':>12s} {'FPR':>10s} "
+        f"{'FNR':>10s} {'P_flip':>10s} "
+        f"{'MAE(muVL)':>14s} {'Q95(|dmu|)':>14s}"
+    )
+    print("-" * 112)
+
+    for row in rows:
+        print(
+            f"{row['Noise (%)']:7.1f}% "
+            f"{row['Agreement']:12.4f} "
+            f"{row['FPR']:10.4f} "
+            f"{row['FNR']:10.4f} "
+            f"{row['P_flip']:10.4f} "
+            f"{row['MAE_muVL']:14.4e} "
+            f"{row['Q95_abs_delta_mu']:14.4e}"
+        )
+
+    print("-" * 112)
+    print(f"Fixed V_L classification threshold: mu_VL > {MU_CLASS_THRESHOLD:g}")
+    print(
+        "Floquet ground truth: unstable if "
+        f"mu_F > {FLOQUET_ZERO_TOL:g}"
+    )
+    print(f"CSV:   {csv_path}")
+    print(f"LaTeX: {tex_path}")
+
+
+# ============================================================
+# 8. EXPERIMENT METADATA + NUMERICAL SANITY CHECK
+# ============================================================
+
+def print_noise_definition():
+    """Print the exact percentage convention used in the experiment."""
+    print("\nExplicit observational-noise convention:")
+    print("  alpha (%) = reported Gaussian noise level")
+    print("  sigma = (alpha / 100) * v_ref")
+    print(f"  v_ref = {V_NOISE_REF:g} (fixed over the entire parameter space)")
+    for alpha in (1.0, 5.0, 10.0):
+        print(
+            f"  {alpha:g}% noise -> sigma = "
+            f"{sigma_from_percent(alpha):.6g}"
+        )
+    print(
+        "  eta_0, eta_tau are independent N(0, sigma^2); "
+        "therefore eta_tau-eta_0 has std sqrt(2)*sigma."
+    )
+
+
+def save_experiment_metadata():
+    """Save the precise noise convention and fixed analysis choices."""
+    path = OUTDIR / "noise_experiment_metadata.txt"
+
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("Gaussian observational-noise experiment for V_L\n")
+        f.write("=" * 56 + "\n\n")
+        f.write("Endpoint measurement model:\n")
+        f.write("  v_tilde(0)   = v(0)   + eta_0\n")
+        f.write("  v_tilde(tau) = v(tau) + eta_tau\n")
+        f.write("  eta_0, eta_tau ~ N(0, sigma^2), independently\n\n")
+        f.write("Noise percentage convention:\n")
+        f.write("  sigma = (alpha/100) * v_ref\n")
+        f.write(f"  v_ref = {V_NOISE_REF:g}, fixed over parameter space\n")
+        for alpha in (1.0, 5.0, 10.0):
+            f.write(
+                f"  alpha={alpha:g}% -> "
+                f"sigma={sigma_from_percent(alpha):.8g}\n"
+            )
+        f.write("\n")
+        f.write("Representative points:\n")
+        for label, (a, q) in REPRESENTATIVE_POINTS.items():
+            f.write(f"  {label}: (a,q)=({a:g},{q:g})\n")
+        f.write("\n")
+        f.write(f"tau = {TAU:g}\n")
+        f.write(f"N_MC_REP = {N_MC_REP}\n")
+        f.write(f"N_MC_MAP = {N_MC_MAP}\n")
+        f.write(
+            f"Fixed V_L classification threshold: "
+            f"mu_VL > {MU_CLASS_THRESHOLD:g}\n"
+        )
+        f.write(
+            f"Floquet ground truth threshold: "
+            f"mu_F > {FLOQUET_ZERO_TOL:g}\n"
+        )
+        f.write(
+            "P_flip = fraction of grid points whose median-noisy "
+            "classification differs from the clean V_L classification.\n"
+        )
+        f.write(
+            "Q95_abs_delta_mu = 95th percentile over the parameter grid of "
+            "|median(mu_VL noisy)-mu_VL clean|.\n"
+        )
+
+    print(f"Saved experiment metadata: {path}")
+
+
+def print_noise_floor_guideline():
+    """
+    For scalar velocity (m=1), delta_eta has RMS sqrt(2)*sigma.
+    Hence a characteristic endpoint noise floor is approximately
+
+        V_L,noise ~ sqrt(2)*sigma / tau.
+
+    This is printed only as an interpretation aid.
+    """
+    print("\nCharacteristic endpoint-noise floor (scalar velocity):")
+    print(
+        f"{'Noise':>8s} {'sigma':>12s} "
+        f"{'sqrt(2)sigma/tau':>20s}"
+    )
+    print("-" * 44)
+
+    for noise in NOISE_LEVELS_PERCENT:
+        sigma = sigma_from_percent(float(noise))
+        floor = math.sqrt(2.0) * sigma / TAU
+        print(f"{noise:7.1f}% {sigma:12.4e} {floor:20.4e}")
+
+
+# ============================================================
+# 9. MAIN
+# ============================================================
+
+def main():
+    print("=" * 72)
+    print("Gaussian observational-noise robustness of V_L")
+    print("=" * 72)
+    print(f"tau = {TAU}")
+    print(f"initial condition = ({X0}, {V0})")
+    print(f"noise reference velocity V_ref = {V_NOISE_REF}")
+    print(
+        "Noise is added ONLY to measured endpoint velocities; "
+        "the ODE remains deterministic."
+    )
+
+    print_noise_definition()
+    print_noise_floor_guideline()
+    save_experiment_metadata()
+
+    # Figure A3 does not require the full parameter-space grid.
+    print("\nGenerating Figure A3 ...")
+    make_figure_A3()
+
+    # Figure A4 and Table A2 require the parameter-space maps.
+    a_values = np.linspace(A_MIN, A_MAX, N_A)
+    q_values = np.linspace(Q_MIN, Q_MAX, N_Q)
+
+    print("\nPreparing clean parameter-space maps ...")
+    delta_v_map, VL_map, muVL_clean_map, muF_map = (
+        load_or_compute_clean_maps(a_values, q_values)
+    )
+
+    # Compact clean-map diagnostic
+    true_unstable_fraction = np.mean(muF_map > FLOQUET_ZERO_TOL)
+    clean_metrics = classification_metrics(muVL_clean_map, muF_map)
+
+    print("\nClean-map diagnostics:")
+    print(f"  Floquet unstable fraction = {true_unstable_fraction:.4f}")
+    print(f"  Clean agreement           = {clean_metrics['Agreement']:.4f}")
+    print(f"  Clean FPR                 = {clean_metrics['FPR']:.4f}")
+    print(f"  Clean FNR                 = {clean_metrics['FNR']:.4f}")
+
+    print("\nGenerating Figure A4 and Table A2 ...")
+    make_figure_A4_and_table_A2(
+        a_values=a_values,
+        q_values=q_values,
+        delta_v_map=delta_v_map,
+        muVL_clean_map=muVL_clean_map,
+        muF_map=muF_map,
+    )
+
+    print("\nDone. Output directory:")
+    print(OUTDIR.resolve())
+
+
+if __name__ == "__main__":
+    main()
