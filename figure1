@@ -1,0 +1,662 @@
+# ============================================================
+# FIGURE 1
+# Direct comparison of:
+#   1. Classical forward LD
+#   2. V_L
+#   3. Trajectory/state-norm estimator
+#   4. Floquet exponent
+#
+# All quantities are expressed as exponential growth rates.
+# Natural logarithm is used throughout.
+# ============================================================
+
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.integrate import solve_ivp
+from numpy.linalg import lstsq
+
+plt.rcParams.update({
+    "font.size": 12,
+    "axes.labelsize": 12,
+    "axes.titlesize": 12,
+    "xtick.labelsize": 12,
+    "ytick.labelsize": 12,
+    "legend.fontsize": 10
+})
+
+
+# ============================================================
+# 1. Mathieu system
+#
+# x'' + [delta + eps cos(omega t)] x = 0
+#
+# First-order form:
+# x_dot = v
+# v_dot = -[delta + eps cos(omega t)] x
+# ============================================================
+
+def mathieu_rhs(t, y, delta, eps, omega):
+    x, v = y
+
+    dxdt = v
+    dvdt = -(delta + eps * np.cos(omega * t)) * x
+
+    return [dxdt, dvdt]
+
+
+# ============================================================
+# 2. Integrate one trajectory up to tau_max
+# ============================================================
+
+def integrate_trajectory(
+    delta,
+    eps,
+    omega,
+    x0=1.0,
+    v0=0.0,
+    tau_max=300.0,
+    n_eval=30001
+):
+
+    t_eval = np.linspace(0.0, tau_max, n_eval)
+
+    sol = solve_ivp(
+        mathieu_rhs,
+        [0.0, tau_max],
+        [x0, v0],
+        t_eval=t_eval,
+        args=(delta, eps, omega),
+        rtol=1e-10,
+        atol=1e-12,
+        method="DOP853"
+    )
+
+    if not sol.success:
+        raise RuntimeError(sol.message)
+
+    t = sol.t
+    x = sol.y[0]
+    v = sol.y[1]
+
+    return t, x, v
+
+
+# ============================================================
+# 3. Classical forward LD
+#
+# M_p^f(tau)
+# =
+# integral_0^tau
+# [ |x_dot|^p + |v_dot|^p ] dt
+#
+# ============================================================
+
+def cumulative_forward_LD(
+    t,
+    x,
+    v,
+    delta,
+    eps,
+    omega,
+    p=0.5
+):
+
+    acceleration = (
+        -(delta + eps * np.cos(omega * t)) * x
+    )
+
+    integrand = (
+        np.abs(v) ** p
+        + np.abs(acceleration) ** p
+    )
+
+    M = np.zeros_like(t)
+
+    dt = np.diff(t)
+
+    M[1:] = np.cumsum(
+        0.5
+        * (integrand[1:] + integrand[:-1])
+        * dt
+    )
+
+    return M
+
+
+# ============================================================
+# 4. Floquet exponent
+#
+# Coefficient period:
+# T = 2*pi / omega
+#
+# mu_F = (1/T) ln rho(Phi(T))
+#
+# where Phi(T) is the monodromy matrix.
+# ============================================================
+
+def floquet_exponent(delta, eps, omega):
+
+    T = 2.0 * np.pi / omega
+
+    def fundamental_rhs(t, phi_flat):
+
+        Phi = phi_flat.reshape(2, 2)
+
+        c = delta + eps * np.cos(omega * t)
+
+        A = np.array([
+            [0.0, 1.0],
+            [-c,  0.0]
+        ])
+
+        dPhi = A @ Phi
+
+        return dPhi.ravel()
+
+    Phi0 = np.eye(2).ravel()
+
+    sol = solve_ivp(
+        fundamental_rhs,
+        [0.0, T],
+        Phi0,
+        rtol=1e-11,
+        atol=1e-13,
+        method="DOP853"
+    )
+
+    if not sol.success:
+        raise RuntimeError(sol.message)
+
+    Phi_T = sol.y[:, -1].reshape(2, 2)
+
+    multipliers = np.linalg.eigvals(Phi_T)
+
+    rho = np.max(np.abs(multipliers))
+
+    mu_F = np.log(rho) / T
+
+    # Stable Mathieu region:
+    # numerical roundoff may produce a tiny nonzero number.
+    if abs(mu_F) < 1e-10:
+        mu_F = 0.0
+
+    return mu_F, multipliers
+
+
+# ============================================================
+# 5. Evaluate indicators at selected integration horizons
+# ============================================================
+
+def compute_growth_rates(
+    tau_list,
+    delta,
+    eps,
+    omega,
+    x0=1.0,
+    v0=0.0,
+    p=0.5,
+    n_eval=30001
+):
+
+    tau_max = np.max(tau_list)
+
+    # --------------------------------------------------------
+    # Integrate trajectory once
+    # --------------------------------------------------------
+
+    t, x, v = integrate_trajectory(
+        delta,
+        eps,
+        omega,
+        x0,
+        v0,
+        tau_max,
+        n_eval
+    )
+
+    # --------------------------------------------------------
+    # Classical LD
+    # --------------------------------------------------------
+
+    M_full = cumulative_forward_LD(
+        t,
+        x,
+        v,
+        delta,
+        eps,
+        omega,
+        p
+    )
+
+    # --------------------------------------------------------
+    # Evaluate x, v, and M at tau_list
+    # --------------------------------------------------------
+
+    x_tau = np.interp(tau_list, t, x)
+    v_tau = np.interp(tau_list, t, v)
+    M_tau = np.interp(tau_list, t, M_full)
+
+    tau_arr = np.asarray(tau_list, dtype=float)
+
+    # --------------------------------------------------------
+    # V_L
+    #
+    # V_L(tau) = |v(tau)-v(0)| / tau
+    # --------------------------------------------------------
+
+    V_L = np.abs(v_tau - v0) / tau_arr
+
+    # --------------------------------------------------------
+    # Trajectory/state norm
+    #
+    # z(t) = (x(t), v(t))
+    # --------------------------------------------------------
+
+    norm_tau = np.sqrt(
+        x_tau**2 + v_tau**2
+    )
+
+    norm_0 = np.sqrt(
+        x0**2 + v0**2
+    )
+
+    # --------------------------------------------------------
+    # Finite-time growth rates
+    #
+    # Natural logarithm is used throughout.
+    # --------------------------------------------------------
+
+    tiny = 1e-300
+
+    # LD:
+    #
+    # If M_p ~ exp(p mu tau),
+    #
+    # mu_LD ~ ln(M_p)/(p tau)
+    #
+    mu_LD = (
+        np.log(np.maximum(M_tau, tiny))
+        / (p * tau_arr)
+    )
+
+    # Proposed V_L growth rate
+    mu_VL = (
+        np.log(np.maximum(V_L, tiny))
+        / tau_arr
+    )
+
+    # Elementary trajectory-norm estimator
+    mu_norm = (
+        np.log(
+            np.maximum(norm_tau, tiny)
+            / norm_0
+        )
+        / tau_arr
+    )
+
+    return {
+        "tau": tau_arr,
+        "M": M_tau,
+        "VL": V_L,
+        "norm": norm_tau,
+        "mu_LD": mu_LD,
+        "mu_VL": mu_VL,
+        "mu_norm": mu_norm
+    }
+
+
+# ============================================================
+# 6. Asymptotic growth rate via linear fit
+#
+# LD:
+# slope[ln M_p] / p
+#
+# V_L:
+# slope[ln V_L]
+#
+# norm:
+# slope[ln ||z||]
+# ============================================================
+
+def asymptotic_fit(
+    tau,
+    quantity,
+    tau_min=150.0,
+    scale_factor=1.0
+):
+
+    tau = np.asarray(tau)
+    quantity = np.asarray(quantity)
+
+    mask = (
+        (tau >= tau_min)
+        & np.isfinite(quantity)
+        & (quantity > 0.0)
+    )
+
+    tau_fit = tau[mask]
+
+    log_quantity = np.log(
+        quantity[mask]
+    )
+
+    A = np.vstack([
+        tau_fit,
+        np.ones_like(tau_fit)
+    ]).T
+
+    slope, intercept = lstsq(
+        A,
+        log_quantity,
+        rcond=None
+    )[0]
+
+    return slope / scale_factor
+
+
+# ============================================================
+# 7. Numerical parameters
+# ============================================================
+
+tau = np.arange(
+    10.0,
+    301.0,
+    1.0
+)
+
+omega = 2.0
+
+# ------------------------------------------------------------
+# Explicit LD exponent
+#
+# If your manuscript actually uses another p,
+# change only this value.
+# ------------------------------------------------------------
+
+p_LD = 0.5
+
+
+# ------------------------------------------------------------
+# Bounded Mathieu solution
+# ------------------------------------------------------------
+
+delta_b = 6.0
+eps_b   = -3.0
+
+
+# ------------------------------------------------------------
+# Unstable Mathieu solution
+# ------------------------------------------------------------
+
+delta_u = 2.0
+eps_u   = -20.0
+
+
+# ------------------------------------------------------------
+# Initial condition
+# ------------------------------------------------------------
+
+x0 = 1.0
+v0 = 0.0
+
+
+# ============================================================
+# 8. Compute bounded case
+# ============================================================
+
+bounded = compute_growth_rates(
+    tau,
+    delta_b,
+    eps_b,
+    omega,
+    x0=x0,
+    v0=v0,
+    p=p_LD
+)
+
+muF_b, multipliers_b = floquet_exponent(
+    delta_b,
+    eps_b,
+    omega
+)
+
+
+# ============================================================
+# 9. Compute unstable case
+# ============================================================
+
+unstable = compute_growth_rates(
+    tau,
+    delta_u,
+    eps_u,
+    omega,
+    x0=x0,
+    v0=v0,
+    p=p_LD
+)
+
+muF_u, multipliers_u = floquet_exponent(
+    delta_u,
+    eps_u,
+    omega
+)
+
+
+# ============================================================
+# 10. Asymptotic fits over tau >= 150
+# ============================================================
+
+tau_min_fit = 150.0
+
+
+# ------------------------------------------------------------
+# Bounded
+# ------------------------------------------------------------
+
+fit_LD_b = asymptotic_fit(
+    bounded["tau"],
+    bounded["M"],
+    tau_min=tau_min_fit,
+    scale_factor=p_LD
+)
+
+fit_VL_b = asymptotic_fit(
+    bounded["tau"],
+    bounded["VL"],
+    tau_min=tau_min_fit
+)
+
+fit_norm_b = asymptotic_fit(
+    bounded["tau"],
+    bounded["norm"],
+    tau_min=tau_min_fit
+)
+
+
+# ------------------------------------------------------------
+# Unstable
+# ------------------------------------------------------------
+
+fit_LD_u = asymptotic_fit(
+    unstable["tau"],
+    unstable["M"],
+    tau_min=tau_min_fit,
+    scale_factor=p_LD
+)
+
+fit_VL_u = asymptotic_fit(
+    unstable["tau"],
+    unstable["VL"],
+    tau_min=tau_min_fit
+)
+
+fit_norm_u = asymptotic_fit(
+    unstable["tau"],
+    unstable["norm"],
+    tau_min=tau_min_fit
+)
+
+
+# ============================================================
+# 11. Print numerical comparison
+# ============================================================
+
+print("\n====================================================")
+print("REVISED FIGURE 1: GROWTH-RATE COMPARISON")
+print("Natural logarithm used throughout")
+print(f"LD exponent p = {p_LD}")
+print(f"Linear-fit interval: tau >= {tau_min_fit}")
+print("====================================================")
+
+
+print("\nBOUNDED CASE")
+print("------------------------------------")
+print(f"Floquet exponent       = {muF_b:.8f}")
+print(f"LD estimate            = {fit_LD_b:.8f}")
+print(f"V_L estimate           = {fit_VL_b:.8f}")
+print(f"Trajectory norm        = {fit_norm_b:.8f}")
+print("Floquet multipliers    =", multipliers_b)
+
+
+print("\nUNSTABLE CASE")
+print("------------------------------------")
+print(f"Floquet exponent       = {muF_u:.8f}")
+print(f"LD estimate            = {fit_LD_u:.8f}")
+print(f"V_L estimate           = {fit_VL_u:.8f}")
+print(f"Trajectory norm        = {fit_norm_u:.8f}")
+print("Floquet multipliers    =", multipliers_u)
+
+
+# ============================================================
+# 12. Revised Figure 1
+#
+# Panel (a): bounded
+# Panel (b): unstable
+#
+# All curves are directly comparable because they have
+# the same units: exponential growth rate.
+# ============================================================
+
+fig, axs = plt.subplots(
+    1,
+    2,
+    figsize=(12, 4.5),
+    sharex=True
+)
+
+
+# ============================================================
+# Panel (a): bounded motion
+# ============================================================
+
+axs[0].plot(
+    bounded["tau"],
+    bounded["mu_LD"],
+    lw=1.8,
+    label=r"$\mu_{LD}$ ($p={p_LD}$)"
+)
+
+axs[0].plot(
+    bounded["tau"],
+    bounded["mu_VL"],
+    lw=2.0,
+    label=r"$\mu_{V_L}$"
+)
+
+axs[0].plot(
+    bounded["tau"],
+    bounded["mu_norm"],
+    lw=2.0,
+    label=r"$\mu_{\mathrm{A_N}}$"
+)
+
+axs[0].axhline(
+    muF_b,
+    linestyle="--",
+    linewidth=2.0,
+    label=r"$\mu_{\mathrm{Floquet}}$"
+)
+
+axs[0].set_title(
+    r"Bounded: $a=6.0,\ q=1.5$"
+)
+
+axs[0].set_xlabel(
+    r"Integration time $\tau$"
+)
+
+axs[0].set_ylabel(
+    r"Estimated growth rate"
+)
+
+axs[0].grid(
+    True,
+    linestyle=":",
+    alpha=0.7
+)
+
+axs[0].legend(
+    loc="best"
+)
+
+
+# ============================================================
+# Panel (b): unstable motion
+# ============================================================
+
+axs[1].plot(
+    unstable["tau"],
+    unstable["mu_LD"],
+    lw=1.8,
+    label=r"$\mu_{LD}$ ($p={p_LD}$)"
+)
+
+axs[1].plot(
+    unstable["tau"],
+    unstable["mu_VL"],
+    lw=2.0,
+    label=r"$\mu_{V_L}$"
+)
+
+axs[1].plot(
+    unstable["tau"],
+    unstable["mu_norm"],
+    lw=2.0,
+    label=r"$\mu_{\mathrm{A_N}}$"
+)
+
+axs[1].axhline(
+    muF_u,
+    linestyle="--",
+    linewidth=2.0,
+    label=r"$\mu_{\mathrm{Floquet}}$"
+)
+
+axs[1].set_title(
+    r"Unstable: $a=2.0,\ q=10.0$"
+)
+
+axs[1].set_xlabel(
+    r"Integration time $\tau$"
+)
+
+axs[1].grid(
+    True,
+    linestyle=":",
+    alpha=0.7
+)
+
+axs[1].legend(
+    loc="best"
+)
+
+
+plt.tight_layout()
+
+plt.savefig(
+    "Figure1_revised_growth_rate_comparison.png",
+    dpi=300,
+    bbox_inches="tight"
+)
+
+plt.show()
