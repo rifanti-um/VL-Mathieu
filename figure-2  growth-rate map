@@ -1,0 +1,607 @@
+# ============================================================
+# FIGURE 2
+#
+# Parameter-space comparison for the Mathieu equation
+#
+#   x'' + (a - 2 q cos(2t)) x = 0
+#
+# Panels:
+# (a) LD-based growth-rate estimate
+# (b) V_L-based growth-rate estimate
+# (c) trajectory-norm growth-rate estimate
+# ============================================================
+
+import numpy as np
+import matplotlib.pyplot as plt
+
+from scipy.integrate import solve_ivp
+from matplotlib.colors import TwoSlopeNorm, Normalize
+
+
+# ============================================================
+# Plot style
+# ============================================================
+
+plt.rcParams.update({
+    "font.size": 13,
+    "axes.labelsize": 13,
+    "axes.titlesize": 12,
+    "xtick.labelsize": 12,
+    "ytick.labelsize": 12,
+    "legend.fontsize": 12
+})
+
+
+# ============================================================
+# 1. Mathieu equation
+#
+# x'' + (a - 2 q cos(2t)) x = 0
+#
+# First-order form:
+#
+# x_dot = v
+# v_dot = -(a - 2q cos(2t)) x
+# ============================================================
+
+def mathieu_rhs(t, y, a, q):
+
+    x, v = y
+
+    dxdt = v
+
+    dvdt = (
+        -(a - 2.0 * q * np.cos(2.0 * t)) * x
+    )
+
+    return [dxdt, dvdt]
+
+
+# ============================================================
+# 2. Compute all three indicators from ONE trajectory
+#
+# This avoids integrating the same trajectory separately
+# for Figure 2(a), Figure 2(b), and the norm estimator.
+# ============================================================
+
+def compute_indicators(
+    a,
+    q,
+    x0=1.0,
+    v0=0.0,
+    tau=120.0,
+    n_steps=4000,
+    p=0.5
+):
+
+    t_eval = np.linspace(
+        0.0,
+        tau,
+        n_steps
+    )
+
+    sol = solve_ivp(
+        fun=lambda t, y: mathieu_rhs(
+            t, y, a, q
+        ),
+        t_span=(0.0, tau),
+        y0=[x0, v0],
+        t_eval=t_eval,
+        rtol=1e-9,
+        atol=1e-12,
+        method="DOP853"
+    )
+
+    if not sol.success:
+        raise RuntimeError(
+            f"Integration failed at a={a}, q={q}"
+        )
+
+    t = sol.t
+    x = sol.y[0]
+    v = sol.y[1]
+
+
+    # ========================================================
+    # (a) Classical forward LD
+    #
+    # M_p^f(tau)
+    # =
+    # integral_0^tau
+    # [
+    # |x_dot|^p + |v_dot|^p
+    # ] dt
+    #
+    # Here p = 0.5 explicitly.
+    # ========================================================
+
+    acceleration = (
+        -(a - 2.0 * q * np.cos(2.0 * t))
+        * x
+    )
+
+    integrand = (
+        np.abs(v) ** p
+        + np.abs(acceleration) ** p
+    )
+
+    # np.trapezoid is the current NumPy name.
+    # Replace with np.trapz if using an older NumPy version.
+    Mpf = np.trapezoid(
+        integrand,
+        t
+    )
+
+
+    # ========================================================
+    # (b) Proposed V_L
+    #
+    # V_L(tau)
+    # =
+    # |v(tau)-v(0)| / tau
+    # ========================================================
+
+    v_tau = v[-1]
+
+    V_L = (
+        np.abs(v_tau - v0)
+        / tau
+    )
+
+
+    # ========================================================
+    # (c) Elementary trajectory-norm estimator
+    #
+    # z(t) = (x(t), v(t))
+    #
+    # ||z(tau)||_2
+    # =
+    # sqrt(x(tau)^2 + v(tau)^2)
+    #
+    # Because (x0,v0)=(1,0), ||z(0)||=1.
+    # ========================================================
+
+    x_tau = x[-1]
+
+    state_norm = np.sqrt(
+        x_tau**2
+        + v_tau**2
+    )
+
+
+    return Mpf, V_L, state_norm
+
+
+# ============================================================
+# 3. Parameter grid
+# ============================================================
+
+a_min = 0.0
+a_max = 12.0
+n_a = 150
+
+q_min = 0.0
+q_max = 12.0
+n_q = 150
+
+
+a_vals = np.linspace(
+    a_min,
+    a_max,
+    n_a
+)
+
+q_vals = np.linspace(
+    q_min,
+    q_max,
+    n_q
+)
+
+
+# ============================================================
+# 4. Numerical parameters
+# ============================================================
+
+tau = 120.0
+
+# IMPORTANT:
+p = 0.5
+
+x0 = 1.0
+v0 = 0.0
+
+n_steps = 4000
+
+
+# Numerical floor used only to prevent log(0)
+log_floor = 1e-14
+
+
+# ============================================================
+# 5. Allocate maps
+# ============================================================
+
+LD_map = np.zeros(
+    (n_q, n_a)
+)
+
+VL_map = np.zeros(
+    (n_q, n_a)
+)
+
+norm_map = np.zeros(
+    (n_q, n_a)
+)
+
+
+# ============================================================
+# 6. Compute parameter-space maps
+# ============================================================
+
+print("Computing revised Figure 2 maps...")
+print(f"Grid      : {n_a} x {n_q}")
+print(f"tau       : {tau}")
+print(f"LD p      : {p}")
+print("logarithm : natural log")
+print()
+
+
+for j, q in enumerate(q_vals):
+
+    for i, a in enumerate(a_vals):
+
+        Mpf, VL, state_norm = compute_indicators(
+            a=a,
+            q=q,
+            x0=x0,
+            v0=v0,
+            tau=tau,
+            n_steps=n_steps,
+            p=p
+        )
+
+        LD_map[j, i] = Mpf
+        VL_map[j, i] = VL
+        norm_map[j, i] = state_norm
+
+
+    print(
+        f"row {j+1:3d}/{n_q} done"
+    )
+
+
+# ============================================================
+# 7. Convert ALL indicators to growth rates
+#
+# Natural logarithm is used throughout.
+#
+# ------------------------------------------------------------
+# LD
+#
+# If
+#
+# M_p^f ~ exp(p mu tau),
+#
+# then
+#
+# mu_LD = ln(M_p^f) / (p tau).
+#
+# ------------------------------------------------------------
+
+mu_LD = (
+    np.log(
+        np.maximum(
+            LD_map,
+            log_floor
+        )
+    )
+    / (p * tau)
+)
+
+
+# ------------------------------------------------------------
+# V_L
+#
+# mu_VL
+# =
+# ln(V_L) / tau
+# ------------------------------------------------------------
+
+mu_VL = (
+    np.log(
+        np.maximum(
+            VL_map,
+            log_floor
+        )
+    )
+    / tau
+)
+
+
+# ------------------------------------------------------------
+# Elementary trajectory-norm estimator
+#
+# mu_norm
+# =
+# ln ||z(tau)|| / tau
+#
+# Since ||z(0)|| = 1 for (x0,v0)=(1,0),
+# this is identical to
+#
+# (1/tau) ln(||z(tau)|| / ||z(0)||).
+# ------------------------------------------------------------
+
+mu_norm = (
+    np.log(
+        np.maximum(
+            norm_map,
+            log_floor
+        )
+    )
+    / tau
+)
+
+
+# ============================================================
+# 8. Print numerical ranges
+# ============================================================
+
+print("\n==============================================")
+print("Growth-rate ranges")
+print("==============================================")
+
+print(
+    "LD   :",
+    np.nanmin(mu_LD),
+    "to",
+    np.nanmax(mu_LD)
+)
+
+print(
+    "V_L  :",
+    np.nanmin(mu_VL),
+    "to",
+    np.nanmax(mu_VL)
+)
+
+print(
+    "Norm :",
+    np.nanmin(mu_norm),
+    "to",
+    np.nanmax(mu_norm)
+)
+
+
+# ============================================================
+# 9. COMMON colour scale
+# ALL THREE panels use exactly the same:
+#
+#       vmin, vmax, normalisation, and colormap.
+# ============================================================
+
+all_rates = np.concatenate([
+    mu_LD.ravel(),
+    mu_VL.ravel(),
+    mu_norm.ravel()
+])
+
+finite_rates = all_rates[
+    np.isfinite(all_rates)
+]
+
+vmin = np.min(finite_rates)
+vmax = np.max(finite_rates)
+
+
+print("\nCommon colour scale:")
+print(f"vmin = {vmin:.6f}")
+print(f"vmax = {vmax:.6f}")
+
+
+# Zero has physical meaning:
+# no positive exponential growth.
+#
+# If the data include both positive and negative values,
+# centre the shared scale at zero.
+
+# Common linear colour scale for all three panels
+common_norm = Normalize(
+    vmin=vmin,
+    vmax=vmax
+)
+
+# Same colormap as the parameter-space figures in the manuscript
+cmap = "jet"
+
+# Use the same JET colormap in all three panels,
+# consistent with the parameter-space figures in the manuscript.
+cmap = "jet"
+
+
+# ============================================================
+# 10. Revised Figure 2
+# ============================================================
+
+fig, axs = plt.subplots(
+    1,
+    3,
+    figsize=(15.0, 4.8),
+    sharex=True,
+    sharey=True
+)
+
+
+# ------------------------------------------------------------
+# Panel (a): Classical LD growth rate
+# ------------------------------------------------------------
+
+im0 = axs[0].imshow(
+    mu_LD,
+    origin="lower",
+    extent=[
+        a_min,
+        a_max,
+        q_min,
+        q_max
+    ],
+    aspect="auto",
+    cmap=cmap,
+    norm=common_norm
+)
+
+axs[0].set_xlabel(r"$a$")
+axs[0].set_ylabel(r"$q$")
+
+axs[0].set_title(
+    rf"(a) $\mu_{{LD}}$ "
+    rf"$(p={p})$"
+)
+
+
+# ------------------------------------------------------------
+# Panel (b): V_L growth rate
+# ------------------------------------------------------------
+
+im1 = axs[1].imshow(
+    mu_VL,
+    origin="lower",
+    extent=[
+        a_min,
+        a_max,
+        q_min,
+        q_max
+    ],
+    aspect="auto",
+    cmap=cmap,
+    norm=common_norm
+)
+
+axs[1].set_xlabel(r"$a$")
+
+axs[1].set_title(
+    r"(b) $\mu_{V_L}$"
+)
+
+
+# ------------------------------------------------------------
+# Panel (c): trajectory-norm estimator
+# ------------------------------------------------------------
+
+im2 = axs[2].imshow(
+    mu_norm,
+    origin="lower",
+    extent=[
+        a_min,
+        a_max,
+        q_min,
+        q_max
+    ],
+    aspect="auto",
+    cmap=cmap,
+    norm=common_norm
+)
+
+axs[2].set_xlabel(r"$a$")
+
+axs[2].set_title(
+    r"(c) $\mu_{A_N}$"
+)
+
+
+# ============================================================
+# 11. ONE shared colour bar
+#
+# This is important:
+# all panels are measured on exactly the same scale.
+# ============================================================
+
+cbar = fig.colorbar(
+    im2,
+    ax=axs,
+    orientation="vertical",
+    fraction=0.025,
+    pad=0.025
+)
+
+cbar.set_label(
+    r"Estimated exponential growth rate"
+)
+
+
+# ============================================================
+# 12. Overall annotation
+# ============================================================
+
+fig.suptitle(
+    rf"Mathieu equation, $\tau={int(tau)}$",
+    fontsize=13,
+    y=1.02
+)
+
+
+# Adjust manually rather than tight_layout because
+# a shared colour bar is used.
+fig.subplots_adjust(
+    left=0.07,
+    right=0.90,
+    bottom=0.14,
+    top=0.87,
+    wspace=0.13
+)
+
+
+# ============================================================
+# 13. Save figure
+# ============================================================
+
+output_file = (
+    "Figure2_revised_growth_rate_comparison.png"
+)
+
+fig.savefig(
+    output_file,
+    dpi=300,
+    bbox_inches="tight"
+)
+
+print(
+    f"\nFigure saved as: {output_file}"
+)
+
+
+# ============================================================
+# 14. Save numerical maps
+#
+# Useful later for:
+# - error maps
+# - comparison with Floquet map
+# - response to reviewer
+# - supplementary material
+#
+# This prevents recomputing the expensive 200x200 grid.
+# ============================================================
+
+np.savez_compressed(
+    "Figure2_revised_data.npz",
+
+    a_vals=a_vals,
+    q_vals=q_vals,
+
+    LD_map=LD_map,
+    VL_map=VL_map,
+    norm_map=norm_map,
+
+    mu_LD=mu_LD,
+    mu_VL=mu_VL,
+    mu_norm=mu_norm,
+
+    tau=tau,
+    p=p
+)
+
+print(
+    "Numerical maps saved as: "
+    "Figure2_revised_data.npz"
+)
+
+
+plt.show()
