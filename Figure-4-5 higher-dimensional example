@@ -1,0 +1,572 @@
+#FIGURE 4-5
+"""
+Higher-dimensional example: coupled parametric oscillators
+
+Retained figures only:
+A. 4D Floquet spectrum.
+B. Generic trajectory: dominant-exponent selection.
+C. Generic vs mode-2-aligned trajectory: spectral limitation.
+
+Notation:
+    mu_1, mu_2        : positive real Floquet growth rates
+    A_N(tau)          : ||z(tau)|| / ||z(0)||
+    mu_A_N(tau)       : ln(A_N(tau)) / tau
+    mu_VL^glob(tau)   : ln(V_L^glob(tau)) / tau
+"""
+
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.integrate import solve_ivp
+
+plt.rcParams.update({
+    "font.size": 11,
+    "axes.labelsize": 11,
+    "axes.titlesize": 11,
+    "xtick.labelsize": 10,
+    "ytick.labelsize": 10,
+    "legend.fontsize": 9,
+})
+
+TINY = 1e-300
+
+# ============================================================
+# 1. Model parameters
+# ============================================================
+
+# Parameters written exactly in the same convention as the manuscript:
+#   x_i'' + (a_i - 2 q_i cos(2t)) x_i + coupling = 0.
+#
+# These values correspond to the previous epsilon-parameterization
+# epsilon_1 = 0.9 and epsilon_2 = 0.5 through epsilon_i = 2 q_i,
+# i.e. q_i = epsilon_i / 2.
+a1     = 1.0
+q1     = 0.45
+a2     = 1.0
+q2     = 0.25
+kappa  = 0.05
+
+omega  = 2.0
+period = 2.0 * np.pi / omega
+
+
+# ============================================================
+# 2. 4D coupled system
+# z = (x1, v1, x2, v2)^T
+# ============================================================
+
+def system_matrix(t):
+    c = np.cos(omega * t)
+
+    # Directly matches the manuscript form
+    # a_i - 2 q_i cos(2t), including the diagonal coupling term +kappa.
+    c1 = a1 - 2.0 * q1 * c + kappa
+    c2 = a2 - 2.0 * q2 * c + kappa
+
+    return np.array([
+        [0.0,   1.0,    0.0,   0.0],
+        [-c1,   0.0,  kappa,   0.0],
+        [0.0,   0.0,    0.0,   1.0],
+        [kappa, 0.0,   -c2,     0.0],
+    ])
+
+
+# ============================================================
+# 3. Monodromy matrix and Floquet growth rates
+# ============================================================
+
+def monodromy_matrix():
+
+    def fundamental_rhs(t, phi_flat):
+        Phi = phi_flat.reshape(4, 4)
+        return (system_matrix(t) @ Phi).ravel()
+
+    sol = solve_ivp(
+        fundamental_rhs,
+        [0.0, period],
+        np.eye(4).ravel(),
+        rtol=1e-11,
+        atol=1e-13,
+        method="DOP853",
+    )
+
+    if not sol.success:
+        raise RuntimeError(sol.message)
+
+    return sol.y[:, -1].reshape(4, 4)
+
+
+Phi_T = monodromy_matrix()
+
+multipliers, eigenvectors = np.linalg.eig(Phi_T)
+
+floquet_growth_rates = np.log(np.abs(multipliers)) / period
+
+order = np.argsort(floquet_growth_rates)[::-1]
+
+floquet_growth_rates = floquet_growth_rates[order]
+multipliers = multipliers[order]
+eigenvectors = eigenvectors[:, order]
+
+mu_1 = floquet_growth_rates[0]
+mu_2 = floquet_growth_rates[1]
+
+
+# ============================================================
+# 4. Floquet eigenvectors and initial conditions
+# ============================================================
+
+def normalized_real_vector(vec):
+    vec = np.real_if_close(vec, tol=1000)
+    vec = np.asarray(vec, dtype=float)
+    return vec / np.linalg.norm(vec)
+
+
+mode_2 = normalized_real_vector(eigenvectors[:, 1])
+
+generic_ic = np.array([1.0, 0.0, 1.0, 0.0], dtype=float)
+generic_ic /= np.linalg.norm(generic_ic)
+
+mode_2_ic = mode_2.copy()
+
+
+# ============================================================
+# 5. Stroboscopic observation times
+# ============================================================
+
+n_periods = 300
+
+tau = (
+    np.arange(1, n_periods + 1, dtype=float)
+    * period
+)
+
+
+# ============================================================
+# 6. Stroboscopic propagation in Floquet eigenbasis
+# ============================================================
+
+def stroboscopic_trajectory(z0, exact_mode_index=None):
+
+    n = np.arange(1, n_periods + 1, dtype=int)
+
+    if exact_mode_index is None:
+        coeff = np.linalg.solve(eigenvectors, z0)
+    else:
+        coeff = np.zeros(4, dtype=complex)
+        coeff[exact_mode_index] = 1.0
+
+    Z = np.empty((n_periods, 4), dtype=complex)
+
+    for j, m in enumerate(n):
+        modal_amplitudes = coeff * (multipliers ** m)
+        Z[j, :] = eigenvectors @ modal_amplitudes
+
+    Z = np.real_if_close(Z, tol=1000)
+
+    return np.asarray(Z, dtype=float)
+
+
+# ============================================================
+# 7. Global V_L and endpoint norm amplification
+# ============================================================
+
+def compute_observables(z0, exact_mode_index=None):
+
+    Z = stroboscopic_trajectory(
+        z0,
+        exact_mode_index=exact_mode_index
+    )
+
+    v1 = Z[:, 1]
+    v2 = Z[:, 3]
+
+    v0_vec = np.array([z0[1], z0[3]])
+    V = np.column_stack([v1, v2])
+
+    delta_v = V - v0_vec
+
+    V_L_global = (
+        np.linalg.norm(delta_v, axis=1)
+        / tau
+    )
+
+    mu_VL_global = (
+        np.log(np.maximum(V_L_global, TINY))
+        / tau
+    )
+
+    norm_tau = np.linalg.norm(Z, axis=1)
+    norm_0 = np.linalg.norm(z0)
+
+    A_N = norm_tau / max(norm_0, TINY)
+
+    mu_A_N = (
+        np.log(np.maximum(A_N, TINY))
+        / tau
+    )
+
+    return {
+        "Z": Z,
+        "V_L_global": V_L_global,
+        "A_N": A_N,
+        "mu_VL_global": mu_VL_global,
+        "mu_A_N": mu_A_N,
+    }
+
+
+generic = compute_observables(generic_ic)
+
+mode_2_result = compute_observables(
+    mode_2_ic,
+    exact_mode_index=1
+)
+
+
+# ============================================================
+# 8. Print numerical summary
+# ============================================================
+
+coefficients = np.linalg.solve(eigenvectors, generic_ic)
+
+print("\n" + "=" * 74)
+print("4D COUPLED PARAMETRIC OSCILLATOR")
+print("=" * 74)
+
+print("\nParameters")
+print("--------------------------------------")
+print(f"a1     = {a1}")
+print(f"q1     = {q1}")
+print(f"a2     = {a2}")
+print(f"q2     = {q2}")
+print(f"kappa  = {kappa}")
+print(f"omega  = {omega}")
+print(f"period = {period:.8f}")
+
+print("\nFloquet multipliers and growth rates")
+print("--------------------------------------")
+
+for j, (rho, mu_j) in enumerate(
+    zip(multipliers, floquet_growth_rates),
+    start=1
+):
+    print(
+        f"mode {j}: "
+        f"multiplier = {rho: .10f}, "
+        f"growth rate = {mu_j: .10f}"
+    )
+
+n_positive = int(np.sum(floquet_growth_rates > 1e-10))
+
+print(f"\nNumber of positive Floquet growth rates = {n_positive}")
+
+if n_positive < 2:
+    raise RuntimeError(
+        "The chosen parameter set did not produce "
+        "two positive Floquet growth rates."
+    )
+
+print("\nGeneric-IC projections onto unstable Floquet modes")
+print("--------------------------------------")
+print(
+    f"|c_1| = {abs(coefficients[0]):.8e} "
+    f"(mu_1 = {mu_1:.8f})"
+)
+print(
+    f"|c_2| = {abs(coefficients[1]):.8e} "
+    f"(mu_2 = {mu_2:.8f})"
+)
+
+
+# ============================================================
+# FIGURE A — 4D Floquet spectrum
+# ============================================================
+
+fig, ax = plt.subplots(figsize=(6.5, 4.5))
+
+indices = np.arange(1, len(floquet_growth_rates) + 1)
+
+ax.bar(indices, floquet_growth_rates)
+ax.axhline(0.0, linewidth=1.0)
+
+ax.set_xticks(indices)
+ax.set_xlabel("Floquet mode")
+ax.set_ylabel("Floquet growth rate")
+ax.set_title("Floquet spectrum of the 4D coupled oscillator")
+
+ax.grid(
+    True,
+    axis="y",
+    linestyle=":",
+    alpha=0.7
+)
+
+plt.tight_layout()
+
+plt.savefig(
+    "FigureA_Floquet_spectrum_4D.png",
+    dpi=300,
+    bbox_inches="tight"
+)
+
+plt.show()
+
+
+# ============================================================
+# FIGURE B — Generic trajectory
+#
+# mu_VL^glob -> mu_1
+# mu_A_N     -> mu_1
+# mu_2 becomes asymptotically subdominant.
+# ============================================================
+
+fig, ax = plt.subplots(figsize=(7.5, 4.8))
+
+ax.plot(
+    tau,
+    generic["mu_VL_global"],
+    linewidth=2.0,
+    label=r"$\mu_{V_L}^{\mathrm{glob}}$"
+)
+
+ax.plot(
+    tau,
+    generic["mu_A_N"],
+    linewidth=2.0,
+    label=r"$\mu_{A_N}$"
+)
+
+ax.axhline(
+    mu_1,
+    linestyle="--",
+    linewidth=1.8,
+    label=rf"$\mu_1={mu_1:.3f}$"
+)
+
+ax.axhline(
+    mu_2,
+    linestyle=":",
+    linewidth=1.8,
+    label=rf"$\mu_2={mu_2:.3f}$"
+)
+
+ax.set_xlabel(r"Observation time $\tau$")
+ax.set_ylabel("Finite-time growth rate")
+
+ax.set_title(
+    "Generic trajectory: dominant-exponent selection"
+)
+
+ax.grid(
+    True,
+    linestyle=":",
+    alpha=0.7
+)
+
+ax.legend()
+
+plt.tight_layout()
+
+plt.savefig(
+    "FigureB_generic_dominant_exponent.png",
+    dpi=300,
+    bbox_inches="tight"
+)
+
+plt.show()
+
+
+# ============================================================
+# FIGURE C — Mode selection and spectral limitation
+#
+# Generic IC        -> mu_1
+# Mode-2-aligned IC -> mu_2
+# ============================================================
+
+# ============================================================
+# FIGURE C1 — Generic initial condition
+#
+# Generic IC -> mu_1
+# ============================================================
+
+YMIN = -0.53
+YMAX = 0.25
+
+fig, ax = plt.subplots(
+    figsize=(6.2, 4.6)
+)
+
+ax.plot(
+    tau,
+    generic["mu_VL_global"],
+    linewidth=2.0,
+    label=r"$\mu_{V_L}^{\mathrm{glob}}$"
+)
+
+ax.plot(
+    tau,
+    generic["mu_A_N"],
+    linewidth=2.0,
+    label=r"$\mu_{A_N}$"
+)
+
+ax.axhline(
+    mu_1,
+    linestyle="--",
+    linewidth=1.8,
+    label=rf"$\mu_1={mu_1:.3f}$"
+)
+
+ax.axhline(
+    mu_2,
+    linestyle=":",
+    linewidth=1.8,
+    label=rf"$\mu_2={mu_2:.3f}$"
+)
+
+ax.set_title(
+    "Generic initial condition"
+)
+
+ax.set_xlabel(
+    r"Observation time $\tau$"
+)
+
+ax.set_ylabel(
+    "Finite-time growth rate"
+)
+
+ax.set_ylim(
+    YMIN,
+    YMAX
+)
+
+ax.grid(
+    True,
+    linestyle=":",
+    alpha=0.7
+)
+
+ax.legend(
+    loc="lower right"
+)
+
+plt.tight_layout()
+
+plt.savefig(
+    "FigureC1_generic_initial_condition.png",
+    dpi=300,
+    bbox_inches="tight"
+)
+
+plt.show()
+
+
+# ============================================================
+# FIGURE C2 — Mode-2-aligned initial condition
+#
+# Mode-2-aligned IC -> mu_2
+# ============================================================
+
+fig, ax = plt.subplots(
+    figsize=(6.2, 4.6)
+)
+
+ax.plot(
+    tau,
+    mode_2_result["mu_VL_global"],
+    linewidth=2.0,
+    label=r"$\mu_{V_L}^{\mathrm{glob}}$"
+)
+
+ax.plot(
+    tau,
+    mode_2_result["mu_A_N"],
+    linewidth=2.0,
+    label=r"$\mu_{A_N}$"
+)
+
+ax.axhline(
+    mu_1,
+    linestyle="--",
+    linewidth=1.8,
+    label=rf"$\mu_1={mu_1:.3f}$"
+)
+
+ax.axhline(
+    mu_2,
+    linestyle=":",
+    linewidth=1.8,
+    label=rf"$\mu_2={mu_2:.3f}$"
+)
+
+ax.set_title(
+    "Initial condition aligned with mode 2"
+)
+
+ax.set_xlabel(
+    r"Observation time $\tau$"
+)
+
+ax.set_ylabel(
+    "Finite-time growth rate"
+)
+
+ax.set_ylim(
+    YMIN,
+    YMAX
+)
+
+ax.grid(
+    True,
+    linestyle=":",
+    alpha=0.7
+)
+
+ax.legend(
+    loc="lower left"
+)
+
+plt.tight_layout()
+
+plt.savefig(
+    "FigureC2_mode2_aligned_initial_condition.png",
+    dpi=300,
+    bbox_inches="tight"
+)
+
+plt.show()
+
+
+# ============================================================
+# 9. Final interpretation
+# ============================================================
+
+print("\n" + "=" * 74)
+print("INTERPRETATION FOR THE REVISED MANUSCRIPT")
+print("=" * 74)
+
+print(
+    "\nFOUR-DIMENSIONAL SPECTRUM:\n"
+    "  The system has two positive Floquet growth rates, mu_1 and mu_2,\n"
+    "  together with two negative partners."
+)
+
+print(
+    "\nGENERIC TRAJECTORY:\n"
+    "  Both mu_VL^glob and mu_A_N approach mu_1. The second positive\n"
+    "  rate mu_2 remains in the spectrum but becomes asymptotically\n"
+    "  subdominant because mu_1 > mu_2."
+)
+
+print(
+    "\nMODE-SELECTIVE TRAJECTORY:\n"
+    "  For an initial condition aligned with the second unstable Floquet\n"
+    "  mode, both mu_VL^glob and mu_A_N approach mu_2."
+)
+
+print(
+    "\nSPECTRAL LIMITATION:\n"
+    "  A single scalar/global V_L does not reconstruct the complete\n"
+    "  Floquet spectrum. It detects the largest Floquet growth rate\n"
+    "  excited and visible in the selected trajectory."
+)
