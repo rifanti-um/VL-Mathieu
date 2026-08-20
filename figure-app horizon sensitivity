@@ -1,0 +1,951 @@
+# -*- coding: utf-8 -*-
+"""
+Appendix experiment: integration-horizon sensitivity for the Mathieu equation
+
+    x'' + (a - 2 q cos(2t)) x = 0.
+
+Final configuration
+-------------------
+- Parameter-space resolution: 200 x 200.
+- Main manuscript initial condition: x(0)=1, v(0)=0.
+- Solver: DOP853, rtol=1e-10, atol=1e-12.
+- Figure A1 uses a genuinely near-Floquet-boundary point:
+      (a,q) = (0.5, 0.4738),
+  for which mu_F is approximately 8.49e-3 with the settings below.
+
+Outputs
+-------
+1. Figure_A1_representative_convergence.png/.pdf
+   mu_VL(tau), G_N(tau), and dominant Floquet rate mu_F
+   for stable, near-boundary, and unstable trajectories.
+
+2. Figure_A2_horizon_sensitivity.png/.pdf
+   (a) mu_VL(a,q; tau=80)
+   (b) mu_VL(a,q; tau=120)
+   (c) mu_VL(a,q; tau=160)
+   (d) |mu_VL(a,q;160)-mu_VL(a,q;120)|
+
+3. Table_A1_horizon_sensitivity.csv/.tex
+   P_rate, P_class, FPR, and FNR for successive horizon pairs.
+
+Definitions
+-----------
+P_rate:
+    percentage of grid points for which the numerical growth-rate estimate
+    satisfies a mixed absolute-relative convergence criterion.
+
+P_class:
+    percentage of grid points whose binary stable/unstable classification
+    remains unchanged between two successive horizons.
+
+FPR/FNR:
+    computed against Floquet stability, at the larger horizon in each pair.
+
+Important
+---------
+The mixed 5% criterion is a numerical sensitivity criterion, not a universal
+theoretical constant. P_class is kept separate because growth-regime
+classification may stabilize earlier than the precise numerical value of
+mu_VL.
+"""
+
+import os
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+from scipy.integrate import solve_ivp
+from concurrent.futures import ProcessPoolExecutor
+from multiprocessing import freeze_support
+
+
+# ============================================================
+# 1. GLOBAL SETTINGS
+# ============================================================
+
+# Mathieu parameter domain
+A_MIN, A_MAX = 0.0, 12.0
+Q_MIN, Q_MAX = 0.0, 12.0
+
+# FINAL appendix resolution
+N_GRID = 150
+
+# Initial condition
+X0 = 1.0
+V0 = 0.0
+Z0_NORM = np.hypot(X0, V0)
+
+# ODE solver
+METHOD = "DOP853"
+RTOL = 1.0e-10
+ATOL = 1.0e-12
+TINY = 1.0e-300
+
+# Period of cos(2t)
+T_PERIOD = np.pi
+
+# Horizons used in Table A1
+HORIZONS = np.array([80.0, 120.0, 160.0])
+
+# Horizons shown in Figure A2
+MAP_HORIZONS = (80.0, 120.0, 160.0)
+
+# Figure A1 representative points
+# Near-boundary point chosen from a local Floquet scan around a=0.5.
+REPRESENTATIVE_POINTS = {
+    "Stable":        (6.0, 1.5),
+    "Near-boundary": (0.5, 0.4738),
+    "Unstable":      (2.0, 10.0),
+}
+
+# Dense horizon sequence for Figure A1
+TAU_CURVE = np.arange(10.0, 160.0 + 1e-12, 2.0)
+
+# Floquet ground-truth tolerance
+RHO_TOL = 1.0e-7
+
+# V_L finite-time classification:
+# unstable/growing iff mu_VL > MU_CLASS_TOL.
+# Keep this identical to the classification rule used in the manuscript.
+MU_CLASS_TOL = 0.0
+
+# Rate-convergence criterion:
+#
+# |mu(tau_2)-mu(tau_1)|
+# <= EPS_ABS + EPS_REL*max(|mu(tau_1)|, |mu(tau_2)|)
+#
+# This is a sensitivity criterion only, not a universal constant.
+EPS_REL = 0.05
+EPS_ABS = 1.0e-3
+
+# Parallelization
+N_WORKERS = None
+
+# Versioned cache prevents accidentally reusing an old 81x81 calculation.
+CACHE_FILE = f"horizon_sensitivity_cache_v2_N{N_GRID}.npz"
+
+# Figure settings
+DPI = 300
+CMAP_GROWTH = "jet"
+CMAP_DIFFERENCE = "magma"
+SHOW_FLOQUET_BOUNDARY = True
+
+
+# ============================================================
+# 2. MATHIEU MODEL AND DIAGNOSTICS
+# ============================================================
+
+def mathieu_rhs(t, z, a, q):
+    """First-order Mathieu system: x'=v, v'=-(a-2q cos(2t))x."""
+    x, v = z
+    return np.array([
+        v,
+        -(a - 2.0*q*np.cos(2.0*t))*x
+    ])
+
+
+def variational_rhs(t, y, a, q):
+    """Fundamental matrix equation Phi' = A(t) Phi."""
+    Phi = y.reshape(2, 2)
+
+    A = np.array([
+        [0.0, 1.0],
+        [-(a - 2.0*q*np.cos(2.0*t)), 0.0]
+    ])
+
+    return (A @ Phi).ravel()
+
+
+def dominant_floquet_data(a, q):
+    """
+    Returns
+    -------
+    mu_F : float
+        Nonnegative dominant Floquet growth rate.
+    rho_max : float
+        Maximum modulus of the Floquet multipliers.
+    """
+    sol = solve_ivp(
+        variational_rhs,
+        (0.0, T_PERIOD),
+        np.eye(2).ravel(),
+        args=(a, q),
+        method=METHOD,
+        rtol=RTOL,
+        atol=ATOL,
+        t_eval=[T_PERIOD],
+    )
+
+    if not sol.success:
+        raise RuntimeError(
+            f"Floquet integration failed at (a,q)=({a},{q}): "
+            f"{sol.message}"
+        )
+
+    Phi_T = sol.y[:, -1].reshape(2, 2)
+    multipliers = np.linalg.eigvals(Phi_T)
+    rho_max = float(np.max(np.abs(multipliers)))
+
+    raw_mu = np.log(max(rho_max, TINY)) / T_PERIOD
+    mu_F = max(0.0, float(raw_mu))
+
+    return mu_F, rho_max
+
+
+def trajectory_diagnostics(a, q, horizons):
+    """
+    Integrate one trajectory once up to max(horizons).
+
+    V_L(tau)
+        = |v(tau)-v(0)| / tau
+
+    mu_VL(tau)
+        = log(V_L(tau)) / tau
+
+    G_N(tau)
+        = (1/tau) log(||z(tau)|| / ||z(0)||)
+    """
+    horizons = np.asarray(horizons, dtype=float)
+    order = np.argsort(horizons)
+    hs = horizons[order]
+
+    sol = solve_ivp(
+        mathieu_rhs,
+        (0.0, float(hs[-1])),
+        [X0, V0],
+        args=(a, q),
+        method=METHOD,
+        rtol=RTOL,
+        atol=ATOL,
+        t_eval=hs,
+    )
+
+    if not sol.success:
+        raise RuntimeError(
+            f"Trajectory integration failed at (a,q)=({a},{q}): "
+            f"{sol.message}"
+        )
+
+    x = sol.y[0]
+    v = sol.y[1]
+
+    VL = np.abs(v - V0) / hs
+    mu_VL = np.log(np.maximum(VL, TINY)) / hs
+
+    z_norm = np.hypot(x, v)
+    G_N = np.log(np.maximum(z_norm / Z0_NORM, TINY)) / hs
+
+    # Restore original ordering
+    inv = np.empty_like(order)
+    inv[order] = np.arange(len(order))
+
+    return mu_VL[inv], G_N[inv]
+
+
+# ============================================================
+# 3. FIGURE A1: REPRESENTATIVE-POINT CONVERGENCE
+# ============================================================
+
+def verify_representative_points():
+    """Print Floquet rates to document that the middle point is near boundary."""
+    print("\nRepresentative-point Floquet rates:")
+    for label, (a, q) in REPRESENTATIVE_POINTS.items():
+        mu_f, rho = dominant_floquet_data(a, q)
+        print(
+            f"  {label:13s}: (a,q)=({a:g},{q:g}), "
+            f"mu_F={mu_f:.8f}, rho_max={rho:.8f}"
+        )
+
+
+def make_figure_A1():
+    fig, axes = plt.subplots(
+        1, 3,
+        figsize=(14.4, 4.25),
+        sharex=True
+    )
+
+    for ax, (label, (a, q)) in zip(
+        axes, REPRESENTATIVE_POINTS.items()
+    ):
+        mu_vl, g_n = trajectory_diagnostics(a, q, TAU_CURVE)
+        mu_f, _ = dominant_floquet_data(a, q)
+
+        ax.plot(
+            TAU_CURVE,
+            mu_vl,
+            linewidth=1.6,
+            label=r"$\mu_{V_L}(\tau)$"
+        )
+
+        ax.plot(
+            TAU_CURVE,
+            g_n,
+            linewidth=1.6,
+            label=r"$G_N(\tau)$"
+        )
+
+        ax.axhline(
+            mu_f,
+            linestyle="--",
+            linewidth=1.4,
+            label=r"$\mu_F$"
+        )
+
+        # Horizon used in the main parameter-space map
+        ax.axvline(
+            120.0,
+            linestyle=":",
+            linewidth=1.0
+        )
+
+        ax.set_title(
+            rf"{label}: $(a,q)=({a:g},{q:g})$"
+            + "\n"
+            + rf"$\mu_F={mu_f:.5g}$"
+        )
+
+        ax.set_xlabel(r"Integration horizon $\tau$")
+        ax.grid(alpha=0.25)
+
+    axes[0].set_ylabel("Finite-time growth rate")
+    axes[0].legend(frameon=False, fontsize=10)
+
+    fig.tight_layout()
+
+    fig.savefig(
+        "Figure_A1_representative_convergence.png",
+        dpi=DPI,
+        bbox_inches="tight"
+    )
+    fig.savefig(
+        "Figure_A1_representative_convergence.pdf",
+        bbox_inches="tight"
+    )
+
+    plt.close(fig)
+
+
+# ============================================================
+# 4. PARAMETER-SPACE COMPUTATION: FINAL 200 x 200
+# ============================================================
+
+def _solve_grid_point(task):
+    """Worker for one (a,q) grid point."""
+    iq, ia, a, q = task
+
+    mu_vl, g_n = trajectory_diagnostics(a, q, HORIZONS)
+    mu_f, rho = dominant_floquet_data(a, q)
+
+    return iq, ia, mu_vl, g_n, mu_f, rho
+
+
+def compute_parameter_space():
+    a_values = np.linspace(A_MIN, A_MAX, N_GRID)
+    q_values = np.linspace(Q_MIN, Q_MAX, N_GRID)
+
+    shape_3d = (len(HORIZONS), N_GRID, N_GRID)
+
+    mu_vl_maps = np.full(shape_3d, np.nan)
+    g_n_maps = np.full(shape_3d, np.nan)
+    mu_f_map = np.full((N_GRID, N_GRID), np.nan)
+    rho_map = np.full((N_GRID, N_GRID), np.nan)
+
+    tasks = [
+        (iq, ia, float(a), float(q))
+        for iq, q in enumerate(q_values)
+        for ia, a in enumerate(a_values)
+    ]
+
+    total = len(tasks)
+
+    print(
+        f"\nComputing final parameter-space study: "
+        f"{N_GRID} x {N_GRID} = {total} points"
+    )
+
+    with ProcessPoolExecutor(max_workers=N_WORKERS) as executor:
+        for count, result in enumerate(
+            executor.map(
+                _solve_grid_point,
+                tasks,
+                chunksize=8
+            ),
+            start=1
+        ):
+            iq, ia, mu_vl, g_n, mu_f, rho = result
+
+            mu_vl_maps[:, iq, ia] = mu_vl
+            g_n_maps[:, iq, ia] = g_n
+            mu_f_map[iq, ia] = mu_f
+            rho_map[iq, ia] = rho
+
+            if count % max(1, total // 20) == 0 or count == total:
+                print(
+                    f"  progress: {count}/{total} "
+                    f"({100.0*count/total:.1f}%)"
+                )
+
+    np.savez_compressed(
+        CACHE_FILE,
+        a_values=a_values,
+        q_values=q_values,
+        horizons=HORIZONS,
+        mu_vl_maps=mu_vl_maps,
+        g_n_maps=g_n_maps,
+        mu_f_map=mu_f_map,
+        rho_map=rho_map,
+        n_grid=N_GRID,
+        mu_class_tol=MU_CLASS_TOL,
+        rho_tol=RHO_TOL,
+        eps_rel=EPS_REL,
+        eps_abs=EPS_ABS,
+    )
+
+    print(f"Saved cache: {CACHE_FILE}")
+
+    return (
+        a_values,
+        q_values,
+        mu_vl_maps,
+        g_n_maps,
+        mu_f_map,
+        rho_map
+    )
+
+
+def load_or_compute_parameter_space():
+    if os.path.exists(CACHE_FILE):
+        print(f"\nLoading cached 200 x 200 results: {CACHE_FILE}")
+        data = np.load(CACHE_FILE)
+
+        cached_n = int(np.asarray(data["n_grid"]).item())
+
+        if cached_n != N_GRID:
+            raise ValueError(
+                f"Cache contains N_GRID={cached_n}, "
+                f"but the script requests N_GRID={N_GRID}."
+            )
+
+        return (
+            data["a_values"],
+            data["q_values"],
+            data["mu_vl_maps"],
+            data["g_n_maps"],
+            data["mu_f_map"],
+            data["rho_map"],
+        )
+
+    return compute_parameter_space()
+
+
+def horizon_index(tau):
+    idx = np.where(np.isclose(HORIZONS, tau))[0]
+
+    if len(idx) != 1:
+        raise ValueError(
+            f"Horizon tau={tau} not found in HORIZONS."
+        )
+
+    return int(idx[0])
+
+
+# ============================================================
+# 5. FIGURE A2: HORIZON SENSITIVITY MAPS
+# ============================================================
+
+def add_floquet_boundary(ax, A, Q, mu_f_map, color):
+    """Overlay the Floquet instability boundary."""
+    if not SHOW_FLOQUET_BOUNDARY:
+        return
+
+    try:
+        ax.contour(
+            A,
+            Q,
+            mu_f_map,
+            levels=[1.0e-6],
+            colors=color,
+            linewidths=0.65
+        )
+    except ValueError:
+        pass
+
+
+def make_figure_A2(a_values, q_values, mu_vl_maps, mu_f_map):
+    i80 = horizon_index(80.0)
+    i120 = horizon_index(120.0)
+    i160 = horizon_index(160.0)
+
+    map80 = mu_vl_maps[i80]
+    map120 = mu_vl_maps[i120]
+    map160 = mu_vl_maps[i160]
+
+    diff = np.abs(map160 - map120)
+
+    # Same color limits for panels (a)-(c)
+    finite_growth = np.concatenate([
+        map80[np.isfinite(map80)],
+        map120[np.isfinite(map120)],
+        map160[np.isfinite(map160)]
+    ])
+
+    # Robust common limits prevent isolated endpoint-cancellation spikes
+    # from determining the entire scale.
+    vmin = np.percentile(finite_growth, 1.0)
+    vmax = np.percentile(finite_growth, 99.0)
+
+    diff_finite = diff[np.isfinite(diff)]
+    diff_vmax = np.percentile(diff_finite, 99.0)
+
+    A, Q = np.meshgrid(a_values, q_values)
+
+    # Do not use constrained_layout here because the two colorbars have
+    # dedicated non-overlapping axes.
+    fig, axes = plt.subplots(
+        2, 2,
+        figsize=(11.0, 8.4)
+    )
+
+    fig.subplots_adjust(
+        left=0.075,
+        right=0.875,
+        bottom=0.08,
+        top=0.95,
+        wspace=0.20,
+        hspace=0.23
+    )
+
+    panels = [
+        (axes[0, 0], map80,  r"(a) $\tau=80$"),
+        (axes[0, 1], map120, r"(b) $\tau=120$"),
+        (axes[1, 0], map160, r"(c) $\tau=160$"),
+    ]
+
+    growth_mappable = None
+
+    for ax, arr, title in panels:
+        growth_mappable = ax.pcolormesh(
+            A,
+            Q,
+            arr,
+            shading="auto",
+            cmap=CMAP_GROWTH,
+            vmin=vmin,
+            vmax=vmax
+        )
+
+        add_floquet_boundary(
+            ax,
+            A,
+            Q,
+            mu_f_map,
+            color="k"
+        )
+
+        ax.set_title(title)
+        ax.set_xlabel(r"$a$")
+        ax.set_ylabel(r"$q$")
+
+    # Panel (d)
+    dmap = axes[1, 1].pcolormesh(
+        A,
+        Q,
+        diff,
+        shading="auto",
+        cmap=CMAP_DIFFERENCE,
+        vmin=0.0,
+        vmax=diff_vmax
+    )
+
+    add_floquet_boundary(
+        axes[1, 1],
+        A,
+        Q,
+        mu_f_map,
+        color="w"
+    )
+
+    axes[1, 1].set_title(
+        r"(d) $|\mu_{V_L}(160)-\mu_{V_L}(120)|$"
+    )
+    axes[1, 1].set_xlabel(r"$a$")
+    axes[1, 1].set_ylabel(r"$q$")
+
+    # --------------------------------------------------------
+    # Separate, non-overlapping colorbar axes
+    # --------------------------------------------------------
+    cax_growth = fig.add_axes([
+        0.900, 0.555, 0.018, 0.345
+    ])
+
+    cbar_growth = fig.colorbar(
+        growth_mappable,
+        cax=cax_growth
+    )
+    cbar_growth.set_label(
+        r"$\mu_{V_L}(a,q;\tau)$"
+    )
+
+    cax_diff = fig.add_axes([
+        0.900, 0.115, 0.018, 0.345
+    ])
+
+    cbar_diff = fig.colorbar(
+        dmap,
+        cax=cax_diff
+    )
+    cbar_diff.set_label(
+        r"$|\mu_{V_L}(160)-\mu_{V_L}(120)|$"
+    )
+
+    fig.savefig(
+        "Figure_A2_horizon_sensitivity.png",
+        dpi=DPI,
+        bbox_inches="tight"
+    )
+    fig.savefig(
+        "Figure_A2_horizon_sensitivity.pdf",
+        bbox_inches="tight"
+    )
+
+    plt.close(fig)
+
+
+# ============================================================
+# 6. TABLE A1: P_rate, P_class, FPR, FNR
+# ============================================================
+
+def rate_convergence_mask(mu1, mu2):
+    """
+    Numerical rate-convergence criterion.
+
+    |mu2-mu1|
+    <= EPS_ABS + EPS_REL*max(|mu1|,|mu2|)
+    """
+    diff = np.abs(mu2 - mu1)
+    scale = np.maximum(
+        np.abs(mu1),
+        np.abs(mu2)
+    )
+
+    return diff <= (
+        EPS_ABS + EPS_REL*scale
+    )
+
+
+def finite_time_classification(mu_vl):
+    """
+    Binary V_L classification.
+
+    True  -> finite-time growing/unstable classification
+    False -> non-growing/stable classification
+    """
+    return mu_vl > MU_CLASS_TOL
+
+
+def classification_stability_mask(mu1, mu2):
+    """
+    Classification stability between two successive horizons.
+
+    A grid point is classification-stable if its binary classification
+    does not change when tau is increased.
+    """
+    class1 = finite_time_classification(mu1)
+    class2 = finite_time_classification(mu2)
+
+    return class1 == class2
+
+
+def classification_metrics(mu_vl, rho_map):
+    """
+    Compare the V_L finite-time classification with Floquet ground truth.
+
+    Floquet:
+        unstable iff rho_max > 1 + RHO_TOL
+
+    V_L:
+        unstable iff mu_VL > MU_CLASS_TOL
+
+    Returns
+    -------
+    fpr : false-positive rate
+    fnr : false-negative rate
+    accuracy : overall classification agreement
+    """
+    truth_unstable = rho_map > (1.0 + RHO_TOL)
+    truth_stable = ~truth_unstable
+
+    pred_unstable = finite_time_classification(mu_vl)
+    pred_stable = ~pred_unstable
+
+    FP = np.count_nonzero(
+        pred_unstable & truth_stable
+    )
+    FN = np.count_nonzero(
+        pred_stable & truth_unstable
+    )
+
+    N_stable = np.count_nonzero(truth_stable)
+    N_unstable = np.count_nonzero(truth_unstable)
+
+    fpr = (
+        FP / N_stable
+        if N_stable > 0
+        else np.nan
+    )
+
+    fnr = (
+        FN / N_unstable
+        if N_unstable > 0
+        else np.nan
+    )
+
+    accuracy = np.mean(
+        pred_unstable == truth_unstable
+    )
+
+    return fpr, fnr, accuracy
+
+
+def make_table_A1(mu_vl_maps, rho_map):
+    rows = []
+
+    for j in range(len(HORIZONS) - 1):
+        tau1 = HORIZONS[j]
+        tau2 = HORIZONS[j + 1]
+
+        mu1 = mu_vl_maps[j]
+        mu2 = mu_vl_maps[j + 1]
+
+        valid = (
+            np.isfinite(mu1)
+            & np.isfinite(mu2)
+        )
+
+        # Numerical growth-rate convergence
+        rate_mask = rate_convergence_mask(
+            mu1,
+            mu2
+        )
+
+        p_rate = (
+            np.count_nonzero(rate_mask & valid)
+            / np.count_nonzero(valid)
+            if np.count_nonzero(valid) > 0
+            else np.nan
+        )
+
+        # Stable/unstable classification convergence
+        class_mask = classification_stability_mask(
+            mu1,
+            mu2
+        )
+
+        p_class = (
+            np.count_nonzero(class_mask & valid)
+            / np.count_nonzero(valid)
+            if np.count_nonzero(valid) > 0
+            else np.nan
+        )
+
+        # FPR/FNR evaluated at the larger horizon tau2
+        fpr, fnr, accuracy = classification_metrics(
+            mu2,
+            rho_map
+        )
+
+        rows.append({
+            "Horizon pair": rf"{tau1:g} -> {tau2:g}",
+            "P_rate (%)": 100.0*p_rate,
+            "P_class (%)": 100.0*p_class,
+            "FPR (%)": 100.0*fpr,
+            "FNR (%)": 100.0*fnr,
+        })
+
+    table = pd.DataFrame(rows)
+
+    print(
+        "\nTable A1. Quantitative horizon sensitivity"
+    )
+
+    print(
+        table.to_string(
+            index=False,
+            formatters={
+                "P_rate (%)": "{:.2f}".format,
+                "P_class (%)": "{:.2f}".format,
+                "FPR (%)": "{:.2f}".format,
+                "FNR (%)": "{:.2f}".format,
+            }
+        )
+    )
+
+    table.to_csv(
+        "Table_A1_horizon_sensitivity.csv",
+        index=False,
+        float_format="%.4f"
+    )
+
+    latex = table.to_latex(
+        index=False,
+        escape=False,
+        float_format="%.2f",
+        caption=(
+            "Quantitative sensitivity to the integration horizon. "
+            "$P_{\\mathrm{rate}}$ denotes the percentage of parameter-grid "
+            "points satisfying the mixed absolute-relative convergence "
+            "criterion for the numerical value of $\\mu_{V_L}$, whereas "
+            "$P_{\\mathrm{class}}$ denotes the percentage whose binary "
+            "growth classification remains unchanged between successive "
+            "horizons. FPR and FNR are evaluated at the larger horizon "
+            "relative to Floquet stability."
+        ),
+        label="tab:horizon_sensitivity",
+    )
+
+    with open(
+        "Table_A1_horizon_sensitivity.tex",
+        "w",
+        encoding="utf-8"
+    ) as f:
+        f.write(latex)
+
+    return table
+
+
+# ============================================================
+# 7. SUMMARY NUMBERS FOR THE MANUSCRIPT / RESPONSE LETTER
+# ============================================================
+
+def print_summary(mu_vl_maps, rho_map):
+    print(
+        "\n--- Horizon-sensitivity summary ---"
+    )
+
+    print(
+        "Rate-convergence criterion:\n"
+        f"|Delta mu| <= {EPS_ABS:g} "
+        f"+ {EPS_REL:g}*max(|mu_1|,|mu_2|)"
+    )
+
+    print(
+        f"V_L classification threshold: "
+        f"mu_VL > {MU_CLASS_TOL:g}"
+    )
+
+    print(
+        f"Floquet instability threshold: "
+        f"rho_max > 1 + {RHO_TOL:g}"
+    )
+
+    i120 = horizon_index(120.0)
+    i160 = horizon_index(160.0)
+
+    mu120 = mu_vl_maps[i120]
+    mu160 = mu_vl_maps[i160]
+
+    diff = np.abs(mu160 - mu120)
+
+    print(
+        "\nDifference statistics for tau=120 -> 160:"
+    )
+    print(
+        "  mean   = "
+        f"{np.nanmean(diff):.6g}"
+    )
+    print(
+        "  median = "
+        f"{np.nanmedian(diff):.6g}"
+    )
+    print(
+        "  95th percentile = "
+        f"{np.nanpercentile(diff, 95):.6g}"
+    )
+
+    p_class_120_160 = np.mean(
+        classification_stability_mask(
+            mu120,
+            mu160
+        )
+    )
+
+    p_rate_120_160 = np.mean(
+        rate_convergence_mask(
+            mu120,
+            mu160
+        )
+    )
+
+    print(
+        f"  P_rate(120->160)  = "
+        f"{100*p_rate_120_160:.2f}%"
+    )
+
+    print(
+        f"  P_class(120->160) = "
+        f"{100*p_class_120_160:.2f}%"
+    )
+
+    for tau in (80.0, 120.0, 160.0):
+        idx = horizon_index(tau)
+
+        fpr, fnr, accuracy = classification_metrics(
+            mu_vl_maps[idx],
+            rho_map
+        )
+
+        print(
+            f"tau={tau:g}: "
+            f"FPR={100*fpr:.2f}%, "
+            f"FNR={100*fnr:.2f}%, "
+            f"agreement={100*accuracy:.2f}%"
+        )
+
+
+# ============================================================
+# 8. MAIN
+# ============================================================
+
+def main():
+    verify_representative_points()
+
+    print("\nGenerating Figure A1 ...")
+    make_figure_A1()
+    print("Saved Figure A1.")
+
+    (
+        a_values,
+        q_values,
+        mu_vl_maps,
+        g_n_maps,
+        mu_f_map,
+        rho_map,
+    ) = load_or_compute_parameter_space()
+
+    print("\nGenerating Figure A2 ...")
+    make_figure_A2(
+        a_values,
+        q_values,
+        mu_vl_maps,
+        mu_f_map
+    )
+    print("Saved Figure A2.")
+
+    print("\nGenerating Table A1 ...")
+    make_table_A1(
+        mu_vl_maps,
+        rho_map
+    )
+    print("Saved Table A1.")
+
+    print_summary(
+        mu_vl_maps,
+        rho_map
+    )
+
+    print("\nDone.")
+
+
+if __name__ == "__main__":
+    freeze_support()
+    main()
