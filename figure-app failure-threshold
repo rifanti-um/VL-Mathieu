@@ -1,0 +1,681 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+Failure-threshold stress test for the V_L finite-time growth-rate diagnostic
+============================================================================
+
+Purpose
+-------
+This experiment complements the existing Appendix-D robustness study.
+The original study showed essentially no classification degradation up to
+10% additive Gaussian endpoint noise. Here we intentionally select a
+low-margin, clean-correct unstable trajectory and extend the SAME noise
+convention until an operational failure threshold becomes observable.
+
+Mathieu equation
+----------------
+    x'' + (a - 2 q cos(2t)) x = 0
+
+Endpoint functional
+-------------------
+    V_L(tau)    = |v(tau)-v(0)| / tau
+    mu_VL(tau) = log(V_L(tau)) / tau
+
+Noise model (unchanged from Appendix D)
+---------------------------------------
+    v_tilde(0)   = v(0)   + eta_0
+    v_tilde(tau) = v(tau) + eta_tau
+
+with eta_0, eta_tau ~ N(0, sigma^2) independently and
+
+    sigma = (alpha/100) * v_ref,     v_ref = 1.
+
+Equivalently,
+    eta_tau - eta_0 ~ N(0, 2 sigma^2).
+
+Classification rule (unchanged)
+--------------------------------
+    predicted unstable <=> mu_VL > 0.
+
+Operational failure threshold
+-----------------------------
+For the stress-test trajectory, define
+
+    P_correct(alpha)
+      = P[ noisy mu_VL(alpha) > 0 ],
+
+because the Floquet reference class is unstable.
+
+The empirical operational failure threshold alpha_fail is the smallest
+noise level at which
+
+    P_correct(alpha) < 0.95.
+
+IMPORTANT:
+This is a protocol- and trajectory-dependent operational threshold, not a
+universal noise threshold for all systems or all trajectories.
+
+Stress-test point
+-----------------
+We fix a = 0.5 and choose q automatically so that the clean finite-time rate
+is only slightly above the classification boundary:
+
+    mu_VL_clean(tau=120) = TARGET_CLEAN_MU = 2e-4 > 0.
+
+This makes the clean classification correct but deliberately low-margin.
+The script verifies independently that the Floquet growth rate is positive.
+
+Outputs
+-------
+1. Figure_D11a_noise_failure_signal.png/.pdf
+   Median noisy mu_VL and 5--95% interval versus noise level.
+
+2. Figure_D11b_noise_failure_probability.png/.pdf
+   Correct-classification probability versus noise level, with the 95%
+   operational criterion and empirical failure threshold.
+
+3. Table_D4_noise_failure_threshold.csv
+   Numerical statistics for every tested noise level.
+
+4. noise_failure_threshold_summary.txt
+   Stress-test point, clean quantities, Floquet reference, and threshold.
+"""
+
+from __future__ import annotations
+
+import csv
+import math
+from pathlib import Path
+
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.integrate import solve_ivp
+from scipy.optimize import brentq
+
+
+# ============================================================
+# 1. Fixed protocol: kept consistent with Appendix D
+# ============================================================
+
+TAU = 120.0
+X0 = 1.0
+V0 = 0.0
+
+V_NOISE_REF = 1.0
+MU_CLASS_THRESHOLD = 0.0
+FLOQUET_ZERO_TOL = 1e-8
+
+METHOD = "DOP853"
+RTOL = 1e-9
+ATOL = 1e-9
+
+VL_LOG_FLOOR = 1e-12
+RANDOM_SEED = 20260818
+N_MC = 100_000
+
+OUTDIR = Path("noise_failure_threshold")
+OUTDIR.mkdir(parents=True, exist_ok=True)
+
+DPI = 300
+
+
+# ============================================================
+# 2. Low-margin stress-test trajectory
+# ============================================================
+
+A_STRESS = 0.5
+
+# We deliberately require a small but positive clean classification margin.
+TARGET_CLEAN_MU = 2.0e-4
+
+# q bracket containing the transition from negative to positive clean mu_VL
+Q_BRACKET = (0.4738, 0.4800)
+
+
+# ============================================================
+# 3. Noise grid
+# ============================================================
+
+# Preserve all original Appendix-D noise levels, then extend the stress test.
+ORIGINAL_LEVELS = np.array([0.0, 0.5, 1.0, 2.0, 5.0, 10.0])
+
+# Dense continuation so the 95% crossing can be located empirically.
+EXTENDED_LEVELS = np.arange(12.5, 200.0 + 2.5, 2.5)
+
+NOISE_LEVELS_PERCENT = np.unique(
+    np.concatenate([ORIGINAL_LEVELS, EXTENDED_LEVELS])
+)
+
+
+# ============================================================
+# 4. Deterministic Mathieu quantities
+# ============================================================
+
+def rhs_mathieu(t, y, a, q):
+    x, v = y
+    return np.array([
+        v,
+        -(a - 2.0 * q * np.cos(2.0 * t)) * x
+    ])
+
+
+def endpoint_velocity(a, q):
+    sol = solve_ivp(
+        lambda t, y: rhs_mathieu(t, y, a, q),
+        (0.0, TAU),
+        (X0, V0),
+        method=METHOD,
+        rtol=RTOL,
+        atol=ATOL,
+    )
+
+    if not sol.success:
+        raise RuntimeError(sol.message)
+
+    return float(sol.y[1, -1])
+
+
+def clean_quantities(a, q):
+    v_tau = endpoint_velocity(a, q)
+    delta_v = v_tau - V0
+
+    V_L = abs(delta_v) / TAU
+    mu_VL = math.log(max(V_L, VL_LOG_FLOOR)) / TAU
+
+    return delta_v, V_L, mu_VL
+
+
+def floquet_growth_rate(a, q):
+    """
+    Compute the largest real Floquet growth rate over T=pi:
+        mu_F = max_j log(|rho_j|)/T.
+    """
+    T = math.pi
+
+    def fundamental_rhs(t, phi_flat):
+        Phi = phi_flat.reshape(2, 2)
+
+        A = np.array([
+            [0.0, 1.0],
+            [-(a - 2.0 * q * np.cos(2.0 * t)), 0.0],
+        ])
+
+        return (A @ Phi).ravel()
+
+    sol = solve_ivp(
+        fundamental_rhs,
+        (0.0, T),
+        np.eye(2).ravel(),
+        method=METHOD,
+        rtol=RTOL,
+        atol=ATOL,
+    )
+
+    if not sol.success:
+        raise RuntimeError(sol.message)
+
+    M = sol.y[:, -1].reshape(2, 2)
+    rho = np.linalg.eigvals(M)
+
+    return float(np.max(np.log(np.abs(rho)) / T))
+
+
+def calibrate_stress_point():
+    """
+    Find q such that clean mu_VL(TAU) = TARGET_CLEAN_MU.
+    """
+    q_lo, q_hi = Q_BRACKET
+
+    def objective(q):
+        _, _, mu = clean_quantities(A_STRESS, q)
+        return mu - TARGET_CLEAN_MU
+
+    f_lo = objective(q_lo)
+    f_hi = objective(q_hi)
+
+    if f_lo * f_hi >= 0.0:
+        raise RuntimeError(
+            "Q_BRACKET does not bracket TARGET_CLEAN_MU. "
+            f"f(q_lo)={f_lo:.6e}, f(q_hi)={f_hi:.6e}"
+        )
+
+    q_star = brentq(
+        objective,
+        q_lo,
+        q_hi,
+        xtol=1e-12,
+        rtol=1e-12,
+    )
+
+    delta_v, V_L, mu_clean = clean_quantities(A_STRESS, q_star)
+    mu_F = floquet_growth_rate(A_STRESS, q_star)
+
+    return q_star, delta_v, V_L, mu_clean, mu_F
+
+
+# ============================================================
+# 5. Monte Carlo degradation experiment
+# ============================================================
+
+def sigma_from_percent(alpha_percent):
+    return (alpha_percent / 100.0) * V_NOISE_REF
+
+
+def run_noise_stress_test(delta_v, mu_F):
+    """
+    Use common random numbers across noise levels to reduce Monte-Carlo
+    roughness in the degradation curve.
+
+    Since the Floquet reference class is unstable, P_correct is simply
+    P(mu_VL_noisy > 0).
+    """
+    if not (mu_F > FLOQUET_ZERO_TOL):
+        raise RuntimeError(
+            "Stress-test point is not Floquet-unstable; "
+            "cannot define unstable-class retention probability."
+        )
+
+    rng = np.random.default_rng(RANDOM_SEED)
+
+    # delta_eta = sqrt(2)*sigma*z
+    z = rng.standard_normal(N_MC)
+
+    rows = []
+
+    for alpha in NOISE_LEVELS_PERCENT:
+        sigma = sigma_from_percent(float(alpha))
+
+        if alpha == 0.0:
+            noisy_delta = np.full(N_MC, delta_v, dtype=float)
+        else:
+            noisy_delta = delta_v + math.sqrt(2.0) * sigma * z
+
+        noisy_VL = np.abs(noisy_delta) / TAU
+        noisy_mu = np.log(np.maximum(noisy_VL, VL_LOG_FLOOR)) / TAU
+
+        median = float(np.median(noisy_mu))
+        q05 = float(np.percentile(noisy_mu, 5.0))
+        q95 = float(np.percentile(noisy_mu, 95.0))
+
+        p_correct = float(
+            np.mean(noisy_mu > MU_CLASS_THRESHOLD)
+        )
+
+        rows.append({
+            "alpha_percent": float(alpha),
+            "sigma": sigma,
+            "median_muVL": median,
+            "q05_muVL": q05,
+            "q95_muVL": q95,
+            "P_correct": p_correct,
+        })
+
+    return rows
+
+
+def estimate_failure_threshold(rows, criterion=0.95):
+    """
+    Locate the first Monte-Carlo interval crossing P_correct=criterion
+    and linearly interpolate between the two adjacent tested noise levels.
+    """
+    for i in range(1, len(rows)):
+        p_prev = rows[i - 1]["P_correct"]
+        p_now = rows[i]["P_correct"]
+
+        if p_prev >= criterion and p_now < criterion:
+            a_prev = rows[i - 1]["alpha_percent"]
+            a_now = rows[i]["alpha_percent"]
+
+            if p_now == p_prev:
+                alpha_interp = a_now
+            else:
+                alpha_interp = (
+                    a_prev
+                    + (criterion - p_prev)
+                    * (a_now - a_prev)
+                    / (p_now - p_prev)
+                )
+
+            return {
+                "alpha_first_below": a_now,
+                "p_first_below": p_now,
+                "alpha_interpolated": float(alpha_interp),
+                "alpha_previous": a_prev,
+                "p_previous": p_prev,
+            }
+
+    return None
+
+
+# ============================================================
+# 6. Save numerical table
+# ============================================================
+
+def save_csv(rows):
+    path = OUTDIR / "Table_D4_noise_failure_threshold.csv"
+
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=[
+                "alpha_percent",
+                "sigma",
+                "median_muVL",
+                "q05_muVL",
+                "q95_muVL",
+                "P_correct",
+            ],
+        )
+        writer.writeheader()
+        writer.writerows(rows)
+
+    return path
+
+
+# ============================================================
+# 7. Figure D11a: signal degradation
+# ============================================================
+
+def make_signal_figure(rows, mu_clean, threshold_info):
+    alpha = np.array([r["alpha_percent"] for r in rows])
+    med = np.array([r["median_muVL"] for r in rows])
+    q05 = np.array([r["q05_muVL"] for r in rows])
+    q95 = np.array([r["q95_muVL"] for r in rows])
+
+    fig, ax = plt.subplots(figsize=(7.2, 4.8))
+
+    ax.plot(
+        alpha,
+        med,
+        linewidth=2.0,
+        label=r"median $\widetilde{\mu}_{V_L}$",
+    )
+
+    ax.fill_between(
+        alpha,
+        q05,
+        q95,
+        alpha=0.25,
+        label="5--95% interval",
+    )
+
+    ax.axhline(
+        MU_CLASS_THRESHOLD,
+        linestyle="--",
+        linewidth=1.4,
+        label="classification boundary",
+    )
+
+    ax.axhline(
+        mu_clean,
+        linestyle=":",
+        linewidth=1.4,
+        label=r"clean $\mu_{V_L}$",
+    )
+
+    if threshold_info is not None:
+        ax.axvline(
+            threshold_info["alpha_interpolated"],
+            linestyle="-.",
+            linewidth=1.5,
+            label=(
+                rf"$\alpha_{{95}}\approx"
+                + f"{threshold_info['alpha_interpolated']:.0f}"
+                + r"\%$"
+            ),
+        )
+
+    ax.set_xlabel(r"Noise level $\alpha$ (\%)")
+    ax.set_ylabel(r"Finite-time rate $\widetilde{\mu}_{V_L}(120)$")
+    ax.set_title("Noise-induced uncertainty in the $V_L$ growth-rate estimate")
+    ax.grid(True, linestyle=":", alpha=0.7)
+    ax.legend()
+
+    fig.tight_layout()
+
+    png = OUTDIR / "Figure_D11a_noise_failure_signal.png"
+    pdf = OUTDIR / "Figure_D11a_noise_failure_signal.pdf"
+
+    fig.savefig(png, dpi=DPI, bbox_inches="tight")
+    fig.savefig(pdf, bbox_inches="tight")
+    plt.close(fig)
+
+    return png, pdf
+
+
+# ============================================================
+# 8. Figure D11b: correct-classification probability
+# ============================================================
+
+def make_probability_figure(rows, threshold_info):
+    alpha = np.array([r["alpha_percent"] for r in rows])
+    p_correct = np.array([r["P_correct"] for r in rows])
+
+    fig, ax = plt.subplots(figsize=(7.2, 4.8))
+
+    ax.plot(
+        alpha,
+        p_correct,
+        marker="o",
+        markersize=3.5,
+        linewidth=1.8,
+        label=r"$P_{\rm correct}$",
+    )
+
+    ax.axhline(
+        0.95,
+        linestyle="--",
+        linewidth=1.4,
+        label=r"operational criterion $P_{\rm correct}=0.95$",
+    )
+
+    if threshold_info is not None:
+        ax.axvline(
+            threshold_info["alpha_interpolated"],
+            linestyle="-.",
+            linewidth=1.5,
+            label=(
+                rf"$\alpha_{{95}}\approx"
+                + f"{threshold_info['alpha_interpolated']:.0f}"
+                + r"\%$"
+            ),
+        )
+
+    # Mark the upper limit of the original Appendix-D test range.
+    ax.axvline(
+        10.0,
+        linestyle=":",
+        linewidth=1.3,
+        label="previously tested upper level (10%)",
+    )
+
+    ax.set_xlabel(r"Noise level $\alpha$ (\%)")
+    ax.set_ylabel(r"Correct-classification probability $P_{\rm correct}$")
+    ax.set_ylim(0.80, 1.005)
+    ax.set_title("Operational failure threshold under additive endpoint noise")
+    ax.grid(True, linestyle=":", alpha=0.7)
+    ax.legend()
+
+    fig.tight_layout()
+
+    png = OUTDIR / "Figure_D11b_noise_failure_probability.png"
+    pdf = OUTDIR / "Figure_D11b_noise_failure_probability.pdf"
+
+    fig.savefig(png, dpi=DPI, bbox_inches="tight")
+    fig.savefig(pdf, bbox_inches="tight")
+    plt.close(fig)
+
+    return png, pdf
+
+
+# ============================================================
+# 9. Summary
+# ============================================================
+
+def save_summary(
+    q_star,
+    delta_v,
+    V_L_clean,
+    mu_clean,
+    mu_F,
+    threshold_info,
+):
+    path = OUTDIR / "noise_failure_threshold_summary.txt"
+
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("V_L NOISE FAILURE-THRESHOLD STRESS TEST\n")
+        f.write("=" * 56 + "\n\n")
+
+        f.write("Fixed protocol\n")
+        f.write("--------------\n")
+        f.write(f"tau = {TAU:g}\n")
+        f.write(f"x0 = {X0:g}\n")
+        f.write(f"v0 = {V0:g}\n")
+        f.write(f"v_ref = {V_NOISE_REF:g}\n")
+        f.write("sigma = (alpha/100) v_ref\n")
+        f.write("eta_0, eta_tau independent N(0,sigma^2)\n")
+        f.write(f"N_MC = {N_MC}\n")
+        f.write(
+            f"classification: unstable iff mu_VL > "
+            f"{MU_CLASS_THRESHOLD:g}\n"
+        )
+        f.write(
+            "operational failure: P_correct < 0.95\n\n"
+        )
+
+        f.write("Low-margin stress-test point\n")
+        f.write("----------------------------\n")
+        f.write(f"a = {A_STRESS:.10f}\n")
+        f.write(f"q = {q_star:.12f}\n")
+        f.write(f"target clean mu_VL = {TARGET_CLEAN_MU:.8e}\n")
+        f.write(f"clean delta_v = {delta_v:.12e}\n")
+        f.write(f"clean V_L = {V_L_clean:.12e}\n")
+        f.write(f"clean mu_VL = {mu_clean:.12e}\n")
+        f.write(f"Floquet mu_F = {mu_F:.12e}\n")
+        f.write(
+            f"Floquet class = "
+            f"{'unstable' if mu_F > FLOQUET_ZERO_TOL else 'stable'}\n\n"
+        )
+
+        if threshold_info is None:
+            f.write(
+                "No 95% operational failure threshold was observed "
+                "within the tested noise range.\n"
+            )
+        else:
+            f.write("Empirical failure threshold\n")
+            f.write("---------------------------\n")
+            f.write(
+                f"interpolated alpha_95 = "
+                f"{threshold_info['alpha_interpolated']:.6f}%\n"
+            )
+            f.write(
+                f"previous grid point: alpha = "
+                f"{threshold_info['alpha_previous']:.3f}%, "
+                f"P_correct = {threshold_info['p_previous']:.6f}\n"
+            )
+            f.write(
+                f"first tested point below 95%: alpha = "
+                f"{threshold_info['alpha_first_below']:.3f}%, "
+                f"P_correct = {threshold_info['p_first_below']:.6f}\n"
+            )
+
+        f.write("\nInterpretation\n")
+        f.write("--------------\n")
+        f.write(
+            "This threshold is operational and trajectory-dependent. "
+            "It is not a universal noise threshold for V_L.\n"
+        )
+        f.write(
+            "The original 0--10% regime remains far below the observed "
+            "failure threshold for this deliberately low-margin, "
+            "clean-correct unstable trajectory.\n"
+        )
+
+    return path
+
+
+# ============================================================
+# 10. Main
+# ============================================================
+
+def main():
+    print("=" * 72)
+    print("V_L FAILURE-THRESHOLD STRESS TEST")
+    print("=" * 72)
+
+    q_star, delta_v, V_L_clean, mu_clean, mu_F = calibrate_stress_point()
+
+    print("\nStress-test point")
+    print("-----------------")
+    print(f"a = {A_STRESS:.10f}")
+    print(f"q = {q_star:.12f}")
+    print(f"clean delta_v = {delta_v:.12e}")
+    print(f"clean V_L     = {V_L_clean:.12e}")
+    print(f"clean mu_VL   = {mu_clean:.12e}")
+    print(f"Floquet mu_F  = {mu_F:.12e}")
+
+    if not (mu_clean > MU_CLASS_THRESHOLD):
+        raise RuntimeError(
+            "The calibrated stress-test point is not clean-classified unstable."
+        )
+
+    if not (mu_F > FLOQUET_ZERO_TOL):
+        raise RuntimeError(
+            "The calibrated stress-test point is not Floquet-unstable."
+        )
+
+    rows = run_noise_stress_test(delta_v, mu_F)
+    threshold_info = estimate_failure_threshold(rows, criterion=0.95)
+
+    csv_path = save_csv(rows)
+    fig1_png, fig1_pdf = make_signal_figure(
+        rows,
+        mu_clean,
+        threshold_info,
+    )
+    fig2_png, fig2_pdf = make_probability_figure(
+        rows,
+        threshold_info,
+    )
+    summary_path = save_summary(
+        q_star,
+        delta_v,
+        V_L_clean,
+        mu_clean,
+        mu_F,
+        threshold_info,
+    )
+
+    print("\nOperational threshold")
+    print("---------------------")
+
+    if threshold_info is None:
+        print("No P_correct < 0.95 crossing found.")
+    else:
+        print(
+            f"Interpolated alpha_95 = "
+            f"{threshold_info['alpha_interpolated']:.3f}%"
+        )
+        print(
+            f"First tested level below 95% = "
+            f"{threshold_info['alpha_first_below']:.1f}% "
+            f"(P_correct={threshold_info['p_first_below']:.5f})"
+        )
+
+    print("\nSaved outputs")
+    print("-------------")
+    for p in (
+        csv_path,
+        fig1_png,
+        fig1_pdf,
+        fig2_png,
+        fig2_pdf,
+        summary_path,
+    ):
+        print(p)
+
+
+if __name__ == "__main__":
+    main()
